@@ -83,6 +83,7 @@ const KEYS = {
   accountBalances: 'account_balances',
   unmappedAccounts: 'unmapped_accounts',
   ignoredAccounts: 'ignored_accounts',
+  balanceIncludesHoldings: 'balance_includes_holdings',
   autoHeal: 'auto_heal',
   autoAdjust: 'auto_adjust',
   telegramConfig: 'telegram_config',
@@ -477,6 +478,31 @@ export class SecretsStore {
   }
   async setIgnoredAccounts(ids: string[]): Promise<void> {
     await this.ctx.api.secrets.set(KEYS.ignoredAccounts, JSON.stringify(ids));
+  }
+
+  /**
+   * SimpleFin account ids where the institution reports `balance` as the
+   * account's total value (cash plus every holding's market value) rather
+   * than SimpleFin's usual cash-only meaning for that field — see
+   * `shared/holdings.ts`'s `cashBalanceFor`. Set from the account mapper on
+   * the Sync page, one checkbox per investment account.
+   *
+   * Malformed degrades to "none marked", i.e. everyone keeps the default
+   * (unmodified) cash behaviour rather than a parse failure silently flipping
+   * an account into the corrected path it was never told to use.
+   */
+  async getBalanceIncludesHoldings(): Promise<string[]> {
+    const raw = await this.ctx.api.secrets.get(KEYS.balanceIncludesHoldings);
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? (parsed as string[]) : [];
+    } catch {
+      return [];
+    }
+  }
+  async setBalanceIncludesHoldings(ids: string[]): Promise<void> {
+    await this.ctx.api.secrets.set(KEYS.balanceIncludesHoldings, JSON.stringify(ids));
   }
 
   /** Which collapsible config cards the user left open, keyed by card id.

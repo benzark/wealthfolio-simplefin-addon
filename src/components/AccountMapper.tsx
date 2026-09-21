@@ -8,6 +8,15 @@ interface Props {
   simplefinAccounts: SimplefinAccount[];
   initialMapping: AccountMapping;
   onSave: (mapping: AccountMapping) => void;
+  /** SimpleFin account ids where the institution's `balance` is the account's
+   *  TOTAL value (cash plus every holding's market value) rather than
+   *  SimpleFin's usual cash-only meaning — see `shared/holdings.ts`. Only
+   *  rendered as a checkbox for accounts that report `holdings` at all; a bank
+   *  or card account has no cash-vs-total ambiguity to mark. Both props
+   *  optional so a caller that predates this feature (or a test) need not pass
+   *  them — the checkbox just does not appear. */
+  balanceIncludesHoldings?: string[];
+  onToggleBalanceIncludesHoldings?: (sfinAccountId: string, checked: boolean) => void;
 }
 
 const CREATE_NEW_VALUE = '__create_new__';
@@ -20,7 +29,10 @@ const ACCOUNT_TYPE_OPTIONS = [
 
 type CreatableAccountType = (typeof ACCOUNT_TYPE_OPTIONS)[number]['type'];
 
-export function AccountMapper({ ctx, simplefinAccounts, initialMapping, onSave }: Props) {
+export function AccountMapper({
+  ctx, simplefinAccounts, initialMapping, onSave,
+  balanceIncludesHoldings, onToggleBalanceIncludesHoldings,
+}: Props) {
   const [wfAccounts, setWfAccounts] = useState<Array<{ id: string; name: string }>>([]);
   const [mapping, setMapping] = useState<AccountMapping>(initialMapping);
   const [loadError, setLoadError] = useState('');
@@ -92,6 +104,22 @@ export function AccountMapper({ ctx, simplefinAccounts, initialMapping, onSave }
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 500 }}>{sfin.name}</div>
             <div className="sfin-subtle" style={{ fontSize: 12 }}>{sfin.currency} • balance: {sfin.balance}</div>
+            {Array.isArray(sfin.holdings) && sfin.holdings.length > 0 && onToggleBalanceIncludesHoldings && (
+              <label
+                style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginTop: 6, fontSize: 12, cursor: 'pointer' }}
+                className="sfin-subtle"
+              >
+                <input
+                  type="checkbox"
+                  style={{ marginTop: 2 }}
+                  checked={(balanceIncludesHoldings ?? []).includes(sfin.id)}
+                  onChange={(e) => onToggleBalanceIncludesHoldings(sfin.id, e.target.checked)}
+                />
+                <span>
+                  Balance above already includes securities value — don't double-count it as cash
+                </span>
+              </label>
+            )}
           </div>
           <div style={{ flex: 1 }}>
             <Select

@@ -3612,4 +3612,58 @@ describe('holdings snapshots for investment accounts', () => {
     await runSyncCore(host, store, { force: true });
     expect(holdings).toEqual([]);
   });
+
+  describe('an account marked balanceIncludesHoldings', () => {
+    // The bug this whole flag exists for: some institutions' SimpleFin bridges
+    // report `balance` as the account's TOTAL value, not its cash sub-balance —
+    // so a plain sync books that total as cash on top of the real positions.
+    const totalValueSeed = (): FakeHostSeed => ({
+      accountSet: { errors: [], accounts: [{
+        id: 'sfin-b', name: 'Schwab Brokerage', currency: 'USD', balance: '1512.34',
+        'balance-date': 1789171200,
+        transactions: [],
+        holdings: [{ symbol: 'VTI', shares: '2', market_value: '512.34' }],
+      }] },
+      mapping: { 'sfin-b': 'wf-b' },
+      accountTypes: { 'wf-b': 'SECURITIES' },
+    });
+
+    it('nets out the marked account\'s holdings value instead of booking the total as cash', async () => {
+      const { host, store, holdings } = createFakeHost(totalValueSeed());
+      (store as any).getBalanceIncludesHoldings = async () => ['sfin-b'];
+
+      await runSyncCore(host, store, { force: true });
+
+      expect(holdings).toEqual([
+        {
+          wfAccountId: 'wf-b',
+          snapshot: {
+            date: '2026-09-12',
+            positions: [{ symbol: 'VTI', quantity: '2', avgCost: undefined, currency: 'USD' }],
+            cashBalances: { USD: '1000' },
+          },
+        },
+      ]);
+    });
+
+    it('leaves an unmarked account\'s cash balance exactly as before', async () => {
+      // Same feed shape, but this account was never told the flag applies —
+      // must stay on the pre-fix behaviour, since that is correct for it.
+      const { host, store, holdings } = createFakeHost(totalValueSeed());
+      (store as any).getBalanceIncludesHoldings = async () => ['some-other-account'];
+
+      await runSyncCore(host, store, { force: true });
+
+      expect(holdings[0].snapshot.cashBalances).toEqual({ USD: '1512.34' });
+    });
+
+    it('does nothing when the host has no getBalanceIncludesHoldings at all', async () => {
+      // Mirrors the getIgnoredAccounts optional-host contract: an older store
+      // or a test double without it must not throw, and must behave as though
+      // no account were marked.
+      const { host, store, holdings } = createFakeHost(totalValueSeed());
+      await runSyncCore(host, store, { force: true });
+      expect(holdings[0].snapshot.cashBalances).toEqual({ USD: '1512.34' });
+    });
+  });
 });

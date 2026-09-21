@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.53.1] - 2026-09-21
+
+### Fixed
+
+- **An investment account's balance no longer counts its own holdings twice.**
+  `toHoldingsSnapshot` wrote SimpleFin's raw account `balance` straight into
+  the snapshot's cash figure, on the documented assumption that `balance` is
+  the cash sub-balance and `holdings` is reported separately — true for most
+  institutions, which is why this went unnoticed. At least one institution's
+  bridge instead reports `balance` as the account's TOTAL value (cash plus
+  every holding's market value), so every sync there booked the whole account
+  value as cash on top of the real positions — live, confirmed on a Schwab
+  brokerage account.
+
+  There is no way to tell which convention an institution uses from the feed
+  alone, so this is not auto-detected: it is a per-account opt-in, "Balance
+  above already includes securities value" on the Sync page's account mapper
+  (Advanced → Accounts). An unmarked account is byte-for-byte unchanged. A
+  marked account computes cash as `balance − Σ market_value` across every
+  reported holding, rounded to the cent like every other money figure in this
+  codebase; if any holding is missing a usable `market_value`, or `balance`
+  itself will not parse, it falls back to the raw (unmarked) figure rather
+  than writing a guess.
+
 ## [1.53.0] - 2026-09-20
 
 ### Added

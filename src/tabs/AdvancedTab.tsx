@@ -88,6 +88,10 @@ export function AdvancedTab({
    *  Surfaced here because that is the only place the decision can be undone —
    *  a preference with no visible off-switch is a trap. */
   const [ignoredAccounts, setIgnoredAccounts] = useState<string[]>([]);
+  /** SimpleFin account ids marked "balance already includes securities value" —
+   *  see `shared/holdings.ts`. Same optional-store contract as ignoredAccounts:
+   *  an older store just means the checkbox always renders unchecked. */
+  const [balanceIncludesHoldings, setBalanceIncludesHoldings] = useState<string[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [accountsError, setAccountsError] = useState('');
   const [mappingSaved, setMappingSaved] = useState(false);
@@ -104,13 +108,15 @@ export function AdvancedTab({
       // state load down with it — every card would then render defaults as
       // though they were the stored settings.
       store.getIgnoredAccounts?.() ?? [],
-    ]).then(([hours, heal, adjust, r, m, ignored]) => {
+      store.getBalanceIncludesHoldings?.() ?? [],
+    ]).then(([hours, heal, adjust, r, m, ignored, includesHoldings]) => {
       setScheduleHours(hours);
       setAutoHeal(heal);
       setAutoAdjust(adjust);
       setRules(r);
       setMapping(m ?? {});
       setIgnoredAccounts(ignored ?? []);
+      setBalanceIncludesHoldings(includesHoldings ?? []);
       setMappingLoaded(true);
     }).catch(() => {
       // `mappingLoaded` deliberately stays FALSE: it gates the mapper, and
@@ -200,6 +206,24 @@ export function AdvancedTab({
       await store.getIgnoredAccounts().then(setIgnoredAccounts).catch(() => {});
     }
   }, [store]);
+
+  /**
+   * One checkbox, one account. Optimistic like `saveMapping`'s ignore-list
+   * update: the UI reflects the click immediately, and a failed write reverts
+   * it rather than leaving the checkbox lying about what is actually stored.
+   */
+  const toggleBalanceIncludesHoldings = useCallback(async (sfinAccountId: string, checked: boolean) => {
+    const next = checked
+      ? [...new Set([...balanceIncludesHoldings, sfinAccountId])]
+      : balanceIncludesHoldings.filter((id) => id !== sfinAccountId);
+    setBalanceIncludesHoldings(next);
+    try {
+      await store.setBalanceIncludesHoldings(next);
+    } catch (e: any) {
+      setAccountsError(e?.message ?? 'Could not save that preference');
+      setBalanceIncludesHoldings(balanceIncludesHoldings);
+    }
+  }, [store, balanceIncludesHoldings]);
 
   const changeInterval = useCallback(async (hours: number) => {
     setScheduleHours(hours);
@@ -303,6 +327,8 @@ export function AdvancedTab({
               simplefinAccounts={sfAccounts}
               initialMapping={mapping}
               onSave={saveMapping}
+              balanceIncludesHoldings={balanceIncludesHoldings}
+              onToggleBalanceIncludesHoldings={(id, checked) => void toggleBalanceIncludesHoldings(id, checked)}
             />
             <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
               <Button variant="ghost" onClick={() => void loadAccounts()} disabled={accountsLoading}>

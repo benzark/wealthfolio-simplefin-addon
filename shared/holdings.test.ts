@@ -81,4 +81,73 @@ describe('toHoldingsSnapshot', () => {
     );
     expect(snapshot?.date).toBe('2025-01-01');
   });
+
+  describe('balanceIncludesHoldings', () => {
+    // The flag is per-account and defaults off — an unmarked account must come
+    // out byte-for-byte identical to today's behaviour, since that behaviour is
+    // correct for the overwhelming majority of institutions.
+    it('is ignored by default, and when explicitly false', () => {
+      const holdings = [{ symbol: 'VTI', shares: '2', market_value: '500.00' }];
+      expect(toHoldingsSnapshot(account({ balance: '512.34', holdings }))?.cashBalances)
+        .toEqual({ USD: '512.34' });
+      expect(toHoldingsSnapshot(account({ balance: '512.34', holdings }), false)?.cashBalances)
+        .toEqual({ USD: '512.34' });
+    });
+
+    it('subtracts every holding\'s market value from balance when set', () => {
+      // balance is the ACCOUNT TOTAL here (cash + both positions' market value),
+      // which is exactly the shape that otherwise double-counts the moment the
+      // positions are added — this is the bug the flag exists to fix.
+      const snapshot = toHoldingsSnapshot(
+        account({
+          balance: '1512.34', // 1000 cash + 300 + 212.34 of holdings
+          holdings: [
+            { symbol: 'VTI', shares: '2', market_value: '300' },
+            { symbol: 'AAPL', shares: '1', market_value: '212.34' },
+          ],
+        }),
+        true,
+      );
+      expect(snapshot?.cashBalances).toEqual({ USD: '1000' });
+    });
+
+    it('falls back to raw balance when any holding is missing a market value', () => {
+      // Guessing a wrong cash figure is worse than the pre-fix behaviour it
+      // would replace — an incomplete subtraction is refused entirely rather
+      // than applied partially.
+      const snapshot = toHoldingsSnapshot(
+        account({
+          balance: '1512.34',
+          holdings: [
+            { symbol: 'VTI', shares: '2', market_value: '300' },
+            { symbol: 'AAPL', shares: '1' }, // no market_value
+          ],
+        }),
+        true,
+      );
+      expect(snapshot?.cashBalances).toEqual({ USD: '1512.34' });
+    });
+
+    it('falls back to raw balance when a market value will not parse', () => {
+      const snapshot = toHoldingsSnapshot(
+        account({
+          balance: '1512.34',
+          holdings: [{ symbol: 'VTI', shares: '2', market_value: 'not-a-number' }],
+        }),
+        true,
+      );
+      expect(snapshot?.cashBalances).toEqual({ USD: '1512.34' });
+    });
+
+    it('falls back to raw balance when balance itself will not parse', () => {
+      const snapshot = toHoldingsSnapshot(
+        account({
+          balance: 'garbage',
+          holdings: [{ symbol: 'VTI', shares: '2', market_value: '300' }],
+        }),
+        true,
+      );
+      expect(snapshot?.cashBalances).toEqual({ USD: 'garbage' });
+    });
+  });
 });

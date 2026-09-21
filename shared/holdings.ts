@@ -74,8 +74,15 @@ export interface HoldingsSnapshot {
  * without a share count (nothing to value). Either one makes the host reject the
  * ENTIRE batch, which is why they are filtered rather than passed through and
  * left to fail: one junk line would cost the account its whole snapshot.
+ *
+ * `balanceIncludesHoldings` — set per-account on the Sync page's account
+ * mapper — is for the institutions where that assumption is wrong: see
+ * `cashBalanceFor` below.
  */
-export function toHoldingsSnapshot(account: SimplefinAccount): HoldingsSnapshot | null {
+export function toHoldingsSnapshot(
+  account: SimplefinAccount,
+  balanceIncludesHoldings = false,
+): HoldingsSnapshot | null {
   const holdings = account.holdings;
   if (!Array.isArray(holdings) || holdings.length === 0) return null;
 
@@ -106,6 +113,52 @@ export function toHoldingsSnapshot(account: SimplefinAccount): HoldingsSnapshot 
     // they were not held — then collide with the real snapshot for today.
     date: new Date(account['balance-date'] * 1000).toISOString().slice(0, 10),
     positions,
-    cashBalances: { [account.currency]: account.balance },
+    cashBalances: { [account.currency]: cashBalanceFor(account, balanceIncludesHoldings) },
   };
+}
+
+/**
+ * SimpleFin's `balance` is documented as one number per account, and for the
+ * overwhelming majority of institutions that number IS the cash sub-balance —
+ * separate from `holdings`, which is why the positions above can be added
+ * alongside it without double-counting anything.
+ *
+ * Some institutions' bridges instead put the account's TOTAL value (cash plus
+ * the market value of every holding) in that same field. Nothing in the feed
+ * says which convention is in play — a cash-only balance and a total-value
+ * balance can both look like a perfectly ordinary number — so this cannot be
+ * auto-detected without risking silently corrupting the accounts that already
+ * work. It only ever changes behaviour for an account the user has explicitly
+ * marked, via `balanceIncludesHoldings` (Sync page → account mapper →
+ * "Balance already includes securities value").
+ *
+ * For a marked account, cash is `balance − Σ market_value`, computed from
+ * every reported holding (not just the ones that became a `HoldingsPosition`
+ * above) — a holding's value still counts against the broker's total even when
+ * its symbol or share count was too broken to record as a position. If any
+ * holding is missing a usable `market_value`, or `balance` itself will not
+ * parse, this falls back to the unmarked behaviour (raw `balance`) rather than
+ * writing a guess — an unmarked account's cash stays exactly as it was before
+ * this function existed.
+ */
+function cashBalanceFor(account: SimplefinAccount, balanceIncludesHoldings: boolean): string {
+  if (!balanceIncludesHoldings) return account.balance;
+
+  const balance = Number(account.balance);
+  if (!Number.isFinite(balance)) return account.balance;
+
+  let marketValueTotal = 0;
+  for (const holding of account.holdings ?? []) {
+    const raw = holding.market_value;
+    if (raw === null || raw === undefined || raw === '') return account.balance;
+    const value = Number(raw);
+    if (!Number.isFinite(value)) return account.balance;
+    marketValueTotal += value;
+  }
+  // Rounded to cents, same as every other money subtraction in this codebase
+  // (see e.g. the starting-balance math in sync-core.ts): plain float
+  // subtraction on decimal dollar amounts routinely lands one bit off zero —
+  // 1512.34 - 512.34 is 999.9999999999999, not 1000 — which would otherwise
+  // write a cash balance with a phantom fractional cent on every sync.
+  return String(Math.round((balance - marketValueTotal) * 100) / 100);
 }

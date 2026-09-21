@@ -178,6 +178,30 @@ describe('SecretsStore', () => {
   });
 });
 
+describe('SecretsStore balance-includes-holdings accounts', () => {
+  it('defaults to empty, round-trips a list, and is wiped by clearAll', async () => {
+    const ctx = makeCtx();
+    const s = new SecretsStore(ctx);
+    expect(await s.getBalanceIncludesHoldings()).toEqual([]);
+
+    await s.setBalanceIncludesHoldings(['sfin-a', 'sfin-b']);
+    expect(await s.getBalanceIncludesHoldings()).toEqual(['sfin-a', 'sfin-b']);
+
+    await s.clearAll();
+    expect(await s.getBalanceIncludesHoldings()).toEqual([]);
+  });
+
+  it('degrades to empty rather than throwing on a malformed stored value', async () => {
+    // Same contract as getIgnoredAccounts: a parse failure must not take a
+    // marked account's snapshot down with it — it should just fall back to the
+    // safe (unmarked) default.
+    const { ctx, data } = makeCtxWithData();
+    const s = new SecretsStore(ctx);
+    data['balance_includes_holdings'] = 'not json';
+    expect(await s.getBalanceIncludesHoldings()).toEqual([]);
+  });
+});
+
 describe('SecretsStore transfer link failures', () => {
   it('returns an empty record when nothing is stored', async () => {
     const ctx = makeCtx();

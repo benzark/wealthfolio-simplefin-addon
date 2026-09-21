@@ -286,4 +286,21 @@ export interface SyncStore {
    * addon's Accounts card — this suppresses the nagging, not the account.
    */
   getIgnoredAccounts?(): Promise<string[]>;
+  /**
+   * SimpleFin account ids where the institution's reported `balance` is the
+   * account's TOTAL value (cash plus every holding's market value) rather than
+   * the cash sub-balance SimpleFin's protocol otherwise means by that field.
+   *
+   * Unset for everyone by default, and it has to stay that way: nothing in the
+   * feed distinguishes the two conventions, so guessing would silently corrupt
+   * the (overwhelming majority of) accounts where `balance` already means
+   * cash. Listed here only because the user identified their own institution's
+   * convention and said so — see `toHoldingsSnapshot`'s `balanceIncludesHoldings`
+   * parameter for what this changes.
+   *
+   * Optional for the same reason as `getIgnoredAccounts`: an older host or test
+   * double without it just keeps every account on the unmarked (default)
+   * behaviour.
+   */
+  getBalanceIncludesHoldings?(): Promise<string[]>;
 }

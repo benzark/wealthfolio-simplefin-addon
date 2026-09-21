@@ -2601,10 +2601,16 @@ export async function runSyncCore(
   // the thing that does not.
   const holdingsSnapshots = noHoldings();
   if (host.syncHoldings) {
+    // Read once for the whole loop rather than per-account: it is one stored
+    // list, and re-reading it per account would just be the same round trip
+    // paid N times.
+    const balanceIncludesHoldings = new Set(
+      (await store.getBalanceIncludesHoldings?.().catch(() => [])) ?? [],
+    );
     for (const sfAccount of accountSet.accounts) {
       const wfAccountId = mapping[sfAccount.id];
       if (!wfAccountId) continue;
-      const snapshot = toHoldingsSnapshot(sfAccount);
+      const snapshot = toHoldingsSnapshot(sfAccount, balanceIncludesHoldings.has(sfAccount.id));
       if (!snapshot) continue;
       try {
         const outcome = await host.syncHoldings(wfAccountId, snapshot);
