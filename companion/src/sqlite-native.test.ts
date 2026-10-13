@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { neutralAdjustmentFields } from '../../shared/sync-core.js';
-import { getNativeWealthfolioSpending, getNativeWealthfolioSpendingBetween, getNativeWealthfolioBudgets, getNativeWealthfolioTopSpending,
+import { getNativeRuleCategorizedAmazonRows, getNativeWealthfolioSpending, getNativeWealthfolioSpendingBetween, getNativeWealthfolioBudgets, getNativeWealthfolioTopSpending,
   getNativeAccountBalances, getNativeUncategorizedSpendingTotal, getNativeUncategorizedSpending, getNativeCategoryCatalog, getNativeSubcategorySpending, getNativeSpendingCategories, getNativeCategorizedSpending } from './sqlite-native.js';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'fs';
@@ -27,6 +27,15 @@ function makeTestDb(): { path: string; cleanup: () => void } {
     CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT, account_type TEXT);
     CREATE TABLE budget_groups (id TEXT PRIMARY KEY, name TEXT, key TEXT, color TEXT, icon TEXT, sort_order INTEGER);
     CREATE TABLE budget_group_assignments (id TEXT PRIMARY KEY, group_id TEXT, taxonomy_id TEXT, category_id TEXT);
+    CREATE TABLE app_settings (setting_key TEXT PRIMARY KEY, setting_value TEXT);
+  `);
+  // Spending tracking ON for every account the fixtures in this file use, the
+  // state of a configured install: Wealthfolio only categorises (and only
+  // totals) activities in these accounts, and the uncategorized readers now
+  // honour the same scope. A test about an UNtracked account adds its own.
+  db.exec(`
+    INSERT INTO app_settings VALUES ('spending.enabled', 'true');
+    INSERT INTO app_settings VALUES ('spending.account_ids', '["acct-cash","acct-card","wf-a","wf-cash"]');
   `);
   // One account of each kind the classifier distinguishes. `acct-cash` is the
   // activities default, so a fixture that says nothing about accounts gets the
@@ -540,6 +549,34 @@ describe('sqlite-native', () => {
       try {
         seedWeek(path);
         expect(getNativeWealthfolioTopSpending(path, '2026-06-01', '2026-06-08', 5)).toEqual([]);
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
+  describe('getNativeRuleCategorizedAmazonRows', () => {
+    it("returns labelled Amazon charges a RULE filed, never a user's own choice or an unlabelled charge", () => {
+      const { path, cleanup } = makeTestDb();
+      try {
+        const db = new DatabaseSync(path);
+        db.exec(`
+          ALTER TABLE activity_taxonomy_assignments ADD COLUMN source TEXT;
+          INSERT INTO activities (id, amount, activity_date, activity_type, notes) VALUES
+            ('rule', '10.80', '2026-09-15T00:00:00Z', 'WITHDRAWAL', 'AMAZON MKTPL · Amazon: Hair Care · TRN-1'),
+            ('mine', '20.00', '2026-09-15T00:00:00Z', 'WITHDRAWAL', 'AMAZON MKTPL · Amazon: Books · TRN-2'),
+            ('bare', '30.00', '2026-09-15T00:00:00Z', 'WITHDRAWAL', 'AMAZON MKTPL · TRN-3'),
+            ('old',  '40.00', '2026-06-01T00:00:00Z', 'WITHDRAWAL', 'AMAZON MKTPL · Amazon: Toys · TRN-4');
+          INSERT INTO activity_taxonomy_assignments (activity_id, category_id, taxonomy_id, source) VALUES
+            ('rule', 'c', 'spending_categories', 'rule'),
+            ('mine', 'c', 'spending_categories', 'manual'),
+            ('bare', 'c', 'spending_categories', 'rule'),
+            ('old',  'c', 'spending_categories', 'rule');
+        `);
+        db.close();
+        expect(getNativeRuleCategorizedAmazonRows(path, '2026-08-01', '2026-10-01')).toEqual([
+          { activityId: 'rule', notes: 'AMAZON MKTPL · Amazon: Hair Care · TRN-1' },
+        ]);
       } finally {
         cleanup();
       }
@@ -1514,5 +1551,135 @@ describe('getNativeDrillRows (v1.48)', () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+describe('uncategorized readers: only accounts Wealthfolio tracks for spending', () => {
+  // Wealthfolio refuses a category on any activity outside its spending
+  // accounts ("Activity account is not opted into spending tracking", live
+  // 2026-10-10 on six Robinhood cashback deposits), and its own totals leave
+  // those accounts out. So a needs-a-category row there could never be filed,
+  // and counting it made the digest run ahead of Wealthfolio.
+  const seed = (path: string, settings?: { enabled?: string | null; accountIds?: string | null }) => {
+    const db = new DatabaseSync(path);
+    db.exec(`
+      INSERT INTO accounts (id, name, account_type) VALUES ('acct-untracked', 'Brokerage cash', 'CASH');
+      INSERT INTO activities (id, amount, activity_date, activity_type, notes, account_id) VALUES ('in-scope', '12.00', '2026-07-09T00:00:00Z', 'WITHDRAWAL', 'KROGER · TRN-1', 'acct-cash');
+      INSERT INTO activities (id, amount, activity_date, activity_type, notes, account_id) VALUES ('out-of-scope', '30.00', '2026-07-09T00:00:00Z', 'WITHDRAWAL', 'BROKERAGE FEE · TRN-2', 'acct-untracked');
+    `);
+    if (settings) {
+      db.exec(`DELETE FROM app_settings;`);
+      if (settings.enabled !== null && settings.enabled !== undefined) {
+        db.prepare(`INSERT INTO app_settings VALUES ('spending.enabled', ?)`).run(settings.enabled);
+      }
+      if (settings.accountIds !== null && settings.accountIds !== undefined) {
+        db.prepare(`INSERT INTO app_settings VALUES ('spending.account_ids', ?)`).run(settings.accountIds);
+      }
+    }
+    db.close();
+  };
+  const withDb = (settings: Parameters<typeof seed>[1], fn: (path: string) => void) => {
+    const { path, cleanup } = makeTestDb();
+    try {
+      seed(path, settings);
+      fn(path);
+    } finally {
+      cleanup();
+    }
+  };
+
+  it('leaves an untracked account out of the needs-a-category list', () => withDb(undefined, (path) => {
+    expect(getNativeUncategorizedSpending(path, '2026-07-01', '2026-08-01').map((r) => r.activityId))
+      .toEqual(['in-scope']);
+  }));
+
+  it('leaves it out of the count and total, so they still describe the list', () => withDb(undefined, (path) => {
+    expect(getNativeUncategorizedSpendingTotal(path, '2026-07-01', '2026-08-01')).toEqual({ count: 1, total: 12 });
+  }));
+
+  it('leaves it out of the report cube, the merchant rows and the daily totals', () => withDb(undefined, (path) => {
+    expect(getNativeUncategorizedByMonthAccount(path, '2026-07-01', '2026-08-01'))
+      .toEqual([{ month: '2026-07', accountId: 'acct-cash', amount: 12 }]);
+    expect(getNativeMerchantRows(path, '2026-07-01', '2026-08-01').map((r) => r.amount)).toEqual([12]);
+    expect(getNativeSpendDailyTotals(path, '2026-07-01', '2026-08-01')).toEqual([{ date: '2026-07-09', amount: 12 }]);
+  }));
+
+  it('lists nothing while spending tracking is off, as Wealthfolio files nothing then', () => withDb(
+    { enabled: 'false', accountIds: '["acct-cash","acct-untracked"]' },
+    (path) => expect(getNativeUncategorizedSpending(path, '2026-07-01', '2026-08-01')).toEqual([]),
+  ));
+
+  it('reads absent settings the way Wealthfolio does: tracking off, no accounts', () => withDb(
+    { enabled: null, accountIds: null },
+    (path) => expect(getNativeUncategorizedSpendingTotal(path, '2026-07-01', '2026-08-01')).toEqual({ count: 0, total: 0 }),
+  ));
+
+  it('reads an unparsable account list as empty rather than failing the query', () => withDb(
+    { enabled: 'true', accountIds: 'not json' },
+    (path) => expect(getNativeUncategorizedSpending(path, '2026-07-01', '2026-08-01')).toEqual([]),
+  ));
+});
+
+describe('uncategorized readers: a transfer waiting for its other half', () => {
+  // Live 2026-10-10: a $691.29 Robinhood card payment. The card's half arrived
+  // and the sync typed it as an in-transit TRANSFER_IN; PNC's half was still
+  // pending ("ACH DEBIT ROBINHOOD CCB"), and pending rows are never paired, so
+  // it sat in the needs-a-category list as a $691 purchase — nagging, counted
+  // in the digest, one tap from being filed as spending.
+  const seed = (path: string, half: { id?: string; account?: string; type?: string; amount?: string; date?: string; group?: string | null }) => {
+    const db = new DatabaseSync(path);
+    db.prepare(`INSERT INTO activities (id, amount, activity_date, activity_type, notes, account_id) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run('bank-half', '691.29', '2026-10-10T00:00:00+00:00', 'WITHDRAWAL', 'ACH DEBIT ROBINHOOD CCB · TRN-x · pending', 'acct-cash');
+    db.prepare(`INSERT INTO activities (id, amount, activity_date, activity_type, notes, account_id, source_group_id) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(half.id ?? 'card-half', half.amount ?? '691.29', half.date ?? '2026-10-09T00:00:00+00:00', half.type ?? 'TRANSFER_IN',
+        '↔️ In-transit transfer · PENDING Payment · TRN-y', half.account ?? 'acct-card', half.group ?? null);
+    db.close();
+  };
+  const listed = (half: Parameters<typeof seed>[1]) => {
+    const { path, cleanup } = makeTestDb();
+    try {
+      seed(path, half);
+      return getNativeUncategorizedSpending(path, '2026-10-01', '2026-11-01').map((r) => r.activityId);
+    } finally {
+      cleanup();
+    }
+  };
+
+  it('leaves out a charge whose other half already waits in another account as a transfer', () => {
+    expect(listed({})).toEqual([]);
+  });
+
+  it('leaves it out of the count, the totals and the report cube too', () => {
+    const { path, cleanup } = makeTestDb();
+    try {
+      seed(path, {});
+      expect(getNativeUncategorizedSpendingTotal(path, '2026-10-01', '2026-11-01')).toEqual({ count: 0, total: 0 });
+      expect(getNativeUncategorizedByMonthAccount(path, '2026-10-01', '2026-11-01')).toEqual([]);
+      expect(getNativeSpendDailyTotals(path, '2026-10-01', '2026-11-01')).toEqual([]);
+      expect(getNativeMerchantRows(path, '2026-10-01', '2026-11-01')).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('still lists it when the amounts differ by a cent', () => {
+    expect(listed({ amount: '691.28' })).toEqual(['bank-half']);
+  });
+
+  it('still lists it when the two are more than 5 days apart', () => {
+    expect(listed({ date: '2026-10-04T00:00:00+00:00' })).toEqual(['bank-half']);
+  });
+
+  it('still lists it when the transfer is in the same account', () => {
+    expect(listed({ account: 'acct-cash' })).toEqual(['bank-half']);
+  });
+
+  it('still lists it when that transfer is already linked to something else', () => {
+    expect(listed({ group: 'grp-1' })).toEqual(['bank-half']);
+  });
+
+  it('still lists it when the transfer moves money the same way', () => {
+    // Money out of PNC pairs with money INTO the card, never with another outflow.
+    expect(listed({ type: 'TRANSFER_OUT' })).toEqual(['bank-half']);
   });
 });

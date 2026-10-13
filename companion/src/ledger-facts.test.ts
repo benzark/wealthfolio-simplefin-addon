@@ -50,10 +50,27 @@ describe('getLedgerFacts', () => {
     `, [['card', -84.79], ['card2', -3]]);
     const citi = f.cardBalances.find((c) => c.name === 'Citi')!;
     // −100 + 40; the pending $25 is excluded because the bank's figure is posted-only.
-    expect(citi).toEqual({ name: 'Citi', ledger: -60, bank: -84.79, inFlight: false });
+    // The id is what tells the daily findings which accounts this covers.
+    expect(citi).toEqual({ wfId: 'card', name: 'Citi', ledger: -60, bank: -84.79, inFlight: false });
     expect(f.cardBalances.find((c) => c.name === 'Robinhood')!.inFlight).toBe(true);
     // Cash accounts are not here at all: they already have drift episodes.
     expect(f.cardBalances.map((c) => c.name).sort()).toEqual(['Citi', 'Robinhood']);
+  });
+
+  it('looks up the transfers the sync could not link, keeping only those still unlinked', () => {
+    const path = ledger(`
+      INSERT INTO activities VALUES ('s1','card','WITHDRAWAL',NULL,'2026-06-02','1300','Payment to Citi · TRN-9',NULL,0);
+      INSERT INTO activities VALUES ('s2','cash','TRANSFER_OUT',NULL,'2026-09-10','50','Venmo · TRN-8','grp',0);
+      INSERT INTO activities VALUES ('s3','cash','TRANSFER_OUT',NULL,'2026-09-12','20','Zelle · TRN-7 · pending',NULL,0);
+      INSERT INTO activities VALUES ('s4','cash','TRANSFER_OUT',NULL,'2026-09-12','99','Other · TRN-90',NULL,0);
+    `);
+    const f = getLedgerFacts(path, NOW, new Map(), ['TRN-9', 'TRN-8', 'TRN-7'])!;
+    // TRN-8 was linked since (by hand, say); TRN-90 is a different id that
+    // merely starts the same.
+    expect(f.stuckTransfers).toEqual([
+      { id: 's1', description: 'Payment to Citi', amount: 1300, date: '2026-06-02', account: 'Citi' },
+      { id: 's3', description: 'Zelle', amount: 20, date: '2026-09-12', account: 'Spend' },
+    ]);
   });
 
   it('finds the refund that reduces nothing, and leaves a filed one alone', () => {
@@ -127,6 +144,46 @@ describe('getLedgerFacts', () => {
     `);
     // Entertainment had a good July, so it is two bad months, not a wrong budget.
     expect(f.chronicallyOver).toEqual([{ name: 'Food & Dining', months: 3, averageOver: 140 }]);
+  });
+
+  it('finds a transfer whose other half is missing: the one account off from its bank by exactly that amount', () => {
+    // Spend's placeholder left $3,000; Savings reads exactly $3,000 below its
+    // bank. Spend itself agrees with its bank, so it is not the suspect.
+    const f = facts(`
+      INSERT INTO activities VALUES ('s0','cash','CREDIT',NULL,'2026-04-01','5000','Starting balance · sf1',NULL,0);
+      INSERT INTO activities VALUES ('ph','cash','TRANSFER_OUT',NULL,'2026-08-10','3000','↔️ In-transit transfer · Transfer to Capital One · t9',NULL,0);
+      INSERT INTO activities VALUES ('v0','sav','CREDIT',NULL,'2026-04-01','12919.24','Starting balance · sf2',NULL,0);
+    `, [['cash', 2000], ['sav', 15919.24]]);
+    expect(f.missingLegs).toEqual([{
+      id: 'ph', description: 'Transfer to Capital One', amount: 3000, date: '2026-08-10',
+      fromAccount: 'Spend', toAccount: 'Savings',
+    }]);
+  });
+
+  it('names no missing leg when two accounts could explain it, or none', () => {
+    const ambiguous = facts(`
+      INSERT INTO activities VALUES ('ph','cash','TRANSFER_OUT',NULL,'2026-08-10','50','↔️ In-transit transfer · Move · t9',NULL,0);
+    `, [['cash', -50], ['sav', 50], ['card', 50]]);
+    expect(ambiguous.missingLegs).toEqual([]);
+    const none = facts(`
+      INSERT INTO activities VALUES ('ph','cash','TRANSFER_OUT',NULL,'2026-08-10','50','↔️ In-transit transfer · Move · t9',NULL,0);
+    `, [['cash', -50], ['sav', 0]]);
+    expect(none.missingLegs).toEqual([]);
+  });
+
+  it('leaves a young leg alone: the other bank is usually just ahead of its feed', () => {
+    const f = facts(`
+      INSERT INTO activities VALUES ('ph','cash','TRANSFER_OUT',NULL,'2026-09-18','391.33','↔️ In-transit transfer · Payment · t9',NULL,0);
+    `, [['cash', -391.33], ['card', 391.33]]);
+    expect(f.missingLegs).toEqual([]);
+  });
+
+  it('finds a card whose opening balance says it started in credit', () => {
+    const f = facts(`
+      INSERT INTO activities VALUES ('o1','card','TRANSFER_IN',NULL,'2026-04-20','235.4','Starting balance · sfc',NULL,0);
+      INSERT INTO activities VALUES ('o2','card2','WITHDRAWAL',NULL,'2026-04-20','464.6','Starting balance · sfd',NULL,0);
+    `);
+    expect(f.cardsOpenedInCredit).toEqual([{ name: 'Citi', amount: 235.4, date: '2026-04-20' }]);
   });
 
   it('counts rows Wealthfolio flagged, and survives a schema without the column', () => {

@@ -15,6 +15,8 @@ const clean = (): LedgerFacts => ({
   needsReview: 0,
   categories: [],
   chronicallyOver: [],
+  missingLegs: [],
+  cardsOpenedInCredit: [],
 });
 
 describe('evaluateLedgerChecks', () => {
@@ -92,6 +94,28 @@ describe('evaluateLedgerChecks', () => {
     expect(day3.keys).toEqual(['income-reimbursement:d1']);
   });
 
+  it('names a transfer the sync could not link after three tries, wherever it lives', () => {
+    // 1.57.1: with the daily report on, this replaces the separate "Transfer
+    // stuck" alert — including legs the unlinked-transfer check never sees
+    // (a card's leg, or one a deep scan found months back).
+    const f = clean();
+    f.stuckTransfers = [{ id: 's1', description: 'Payment to Citi', amount: 1300, date: '2026-06-02', account: 'Citi' }];
+    const { findings } = evaluateLedgerChecks(f, {}, NOW);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ key: 'stuck-transfer:s1', severity: 'warning' });
+    expect(findings[0].message).toBe(
+      "Payment to Citi ($1,300.00, Citi, Jun 2) could not be linked to its other half after 3 tries — run Deep scan, or link the pair in Wealthfolio",
+    );
+  });
+
+  it('says a stuck transfer once when the unlinked-transfer check already names it', () => {
+    const f = clean();
+    f.unlinkedTransfers = [{ id: 's1', description: 'Payment to Citi', amount: 1300, direction: 'out', ageDays: 9 }];
+    f.stuckTransfers = [{ id: 's1', description: 'Payment to Citi', amount: 1300, date: '2026-09-11', account: 'Spend' }];
+    const { findings } = evaluateLedgerChecks(f, {}, NOW);
+    expect(findings.map((x) => x.key)).toEqual(['unlinked-transfer:s1']);
+  });
+
   it('flags an unlinked cash transfer, which upstream counts as income or spending', () => {
     const f = clean();
     f.unlinkedTransfers = [
@@ -102,7 +126,7 @@ describe('evaluateLedgerChecks', () => {
     // The one-day-old leg is still inside the window where its pair normally
     // arrives, so only the settled one is worth a line.
     expect(findings).toHaveLength(1);
-    expect(findings[0].message).toContain('$1300.00');
+    expect(findings[0].message).toContain('$1,300.00');
     expect(findings[0].message).toMatch(/income/i);
   });
 
@@ -166,16 +190,47 @@ describe('evaluateLedgerChecks', () => {
     });
   });
 
-  it('caps the block so a bad week cannot bury the spending report', () => {
-    // The digest was called bloated once already. Integrity problems come
-    // first, and everything past the cap collapses into a single line.
+  it('returns every due finding — the report folds them, so there is no cap to hide one behind', () => {
+    // Until 1.57.0 these printed straight into the morning report, capped at
+    // five lines plus "…and N more", and the hidden tail had to be left
+    // unstamped so a once-only finding was not used up unseen. The report now
+    // prints only a count with the whole list behind a button, so nothing is
+    // hidden, and every finding — once-only ones included — is stamped the day
+    // it is said.
     const f = clean();
     f.idleRefunds = Array.from({ length: 9 }, (_, i) => ({ id: `r${i}`, description: `Refund ${i}`, amount: 5 }));
+    f.categories = [{ name: 'Shopping', budget: 100, spent: 500, largest: { id: 'p0', description: 'Buster', amount: 400 } }];
     const { findings, keys } = evaluateLedgerChecks(f, {}, NOW);
-    expect(findings).toHaveLength(5);
-    expect(findings[4].message).toMatch(/5 more/);
-    // Every condition is still tracked, shown or not.
-    expect(keys).toHaveLength(9);
+    expect(findings).toHaveLength(10);
+    expect(findings.some((x) => /more ledger issue/.test(x.message))).toBe(false);
+    expect(keys).toHaveLength(10);
+    expect(keys).toContain('budget-buster:p0');
+  });
+
+  it('writes amounts the way every other message does, with thousands separators', () => {
+    const f = clean();
+    f.idleRefunds = [{ id: 'r1', description: 'Venmo', amount: 1234.5 }];
+    const [finding] = evaluateLedgerChecks(f, {}, NOW).findings;
+    expect(finding.message).toContain('($1,234.50)');
+  });
+
+  it('gives each finding its key, a short button label, and a fix where one exists', () => {
+    const f = clean();
+    f.groupedNonTransfers = [{ id: 'g1', description: 'Payment to Citibank Credit Card Payments', amount: 94.93, type: 'WITHDRAWAL' }];
+    f.idleRefunds = [{ id: 'r1', description: 'Transfer from Venmo Transfers', amount: 50 }];
+    f.needsReview = 4;
+    const { findings } = evaluateLedgerChecks(f, {}, NOW);
+    const byKey = Object.fromEntries(findings.map((x) => [x.key, x]));
+    expect(byKey['grouped-non-transfer:g1'].fix).toEqual({
+      kind: 'make-transfer', activityId: 'g1',
+      description: 'Payment to Citibank Credit Card Payments', amount: 94.93, activityType: 'WITHDRAWAL',
+    });
+    expect(byKey['idle-refund:r1'].fix).toEqual({ kind: 'pick-category', activityId: 'r1' });
+    expect(byKey['needs-review'].fix).toBeUndefined();
+    for (const x of findings) expect((x.label ?? '').length).toBeLessThanOrEqual(45);
+    // The old wording told the reader to "retype it", which does not stick:
+    // the next sync rewrites the type. The message now names the real fix.
+    expect(byKey['grouped-non-transfer:g1'].message).toContain('make it a transfer');
   });
 });
 
@@ -187,4 +242,61 @@ describe('nextLedgerCheckSeen', () => {
     const next = nextLedgerCheckSeen(seen, ['idle-refund:r1', 'held-transfer:h9'], NOW);
     expect(next).toEqual({ 'idle-refund:r1': daysAgo(4), 'held-transfer:h9': NOW.toISOString() });
   });
+});
+
+describe('a transfer whose other half never arrived', () => {
+  // Live 2026-09-23: Spend sent Savings $3,000 on Aug 10, the Savings side
+  // never reached the feed, and Savings sat exactly $3,000 below its bank for
+  // six weeks while the Spend leg counted as $3,000 of spending.
+  const facts = (): LedgerFacts => ({
+    ...clean(),
+    missingLegs: [{
+      id: 'ph', description: 'Transfer to Capital One', amount: 3000, date: '2026-08-10',
+      fromAccount: 'Spend', toAccount: 'Savings',
+    }],
+  });
+
+  it('names the account short by exactly that amount, every day until fixed', () => {
+    const first = evaluateLedgerChecks(facts(), {}, NOW);
+    expect(first.findings).toHaveLength(1);
+    const msg = first.findings[0].message;
+    expect(msg).toContain('Transfer to Capital One');
+    expect(msg).toContain('$3,000.00');
+    expect(msg).toContain('left Spend on Aug 10 but');
+    expect(msg).toContain('Savings');
+    expect(msg).toContain('fix-transfers');
+    // A ledger error: it repeats.
+    const later = evaluateLedgerChecks(facts(), { 'missing-leg:ph': daysAgo(5) }, NOW);
+    expect(later.findings).toHaveLength(1);
+  });
+});
+
+describe('a card that opened in credit', () => {
+  // Live 2026-09-23: Citi's computed opening balance said the card started
+  // $235.40 in credit. It had absorbed a $700 payment the feed never delivered
+  // (true opening: $464.60 owed), which kept the missing payment invisible.
+  const facts = (): LedgerFacts => ({
+    ...clean(),
+    cardsOpenedInCredit: [{ name: 'Citi', amount: 235.4, date: '2026-04-20' }],
+  });
+
+  it('says so once, because a card can genuinely start in credit', () => {
+    const first = evaluateLedgerChecks(facts(), {}, NOW);
+    expect(first.findings).toHaveLength(1);
+    expect(first.findings[0].message).toContain('Citi');
+    expect(first.findings[0].message).toContain('$235.40');
+    const later = evaluateLedgerChecks(facts(), { 'card-opened-in-credit:Citi': daysAgo(3) }, NOW);
+    expect(later.findings).toEqual([]);
+  });
+});
+
+it('reports a leg with a missing partner once, as missing rather than unlinked', () => {
+  const f: LedgerFacts = {
+    ...clean(),
+    unlinkedTransfers: [{ id: 'z', description: 'Payment to Citi', amount: 700, direction: 'out', ageDays: 20 }],
+    missingLegs: [{ id: 'z', description: 'Payment to Citi', amount: 700, date: '2026-06-26', fromAccount: 'Spend', toAccount: 'Citi' }],
+  };
+  const { findings } = evaluateLedgerChecks(f, {}, NOW);
+  expect(findings).toHaveLength(1);
+  expect(findings[0].message).toContain('never arrived');
 });

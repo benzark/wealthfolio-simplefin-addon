@@ -385,6 +385,22 @@ Grand Total:	$120.52
     expect(rows[0].totalCents).toBe(423);
   });
 
+  it('rounds the unrounded float the plain-text copy prints', () => {
+    // Live from 2026-09-15: `Total` / `10.799999999999999 USD` for a $10.80
+    // shipment. Exactly-two-decimals refused it, and the order was lost.
+    const rows = parseAmazonEmail(
+      'Your package was shipped!\nOrder # 113-2704312-9904237\n1 Hair Care item\nTotal\n10.799999999999999 USD',
+    );
+    expect(rows[0].totalCents).toBe(1080);
+  });
+
+  it('does not read an item subtotal as the total', () => {
+    const rows = parseAmazonEmail(
+      'Thanks for your order!\nOrder # 111-2223334-4445556\n1 Electronics item\nItem Subtotal: $9.00\nGrand Total: $9.54',
+    );
+    expect(rows[0].totalCents).toBe(954);
+  });
+
   it('still refuses a bare number with neither $ nor USD as a total', () => {
     // A number alone is not a price — it could be anything else on the line. Only
     // a currency-marked figure is trusted.
@@ -540,5 +556,162 @@ describe('mapAmazonLabel', () => {
       .toBeNull();
     expect(mapAmazonLabel('Electronics', DEFAULT_AMAZON_LABEL_RULES, 'Shopping', true))
       .toBe('Electronics');
+  });
+});
+
+describe('the September 2026 layout: item line BEFORE the order number', () => {
+  // Live, 2026-09-14 (subject "Ordered 1 item: Hair Care"): the category line
+  // moved above "Order #". Splitting at "Order #" left each order's item line
+  // in the previous chunk, so the email read as unrecognised.
+  const SEPT = [
+    'Ordered 1 item: Hair Care',
+    'Your Orders', 'Your Account', 'Buy Again',
+    'Thanks for your order!',
+    'Ordered', 'Shipped', 'Out for delivery', 'Delivered',
+    'Arriving Wednesday',
+    '⁦1⁩ Hair Care item',
+    'Nicholas - LOUISVILLE, KY',
+    'Order # ‫113-2704312-9904237',
+    'View or edit order',
+    'Grand Total:',
+    '$10.80',
+  ].join('\n');
+
+  it('reads the order, its label and its total', () => {
+    expect(parseAmazonEmail(SEPT)).toEqual([{
+      orderId: '113-2704312-9904237', kind: 'ordered', totalCents: 1080, itemCount: 1, labels: ['Hair Care'],
+    }]);
+  });
+
+  it('gives each order in a two-order email its own label', () => {
+    const two = [
+      'Thanks for your order!',
+      '1 Hair Care item', 'Order # 113-0000000-0000001', 'Grand Total:', '$10.80',
+      '2 Books items', 'Order # 113-0000000-0000002', 'Grand Total:', '$25.00',
+    ].join('\n');
+    const orders = parseAmazonEmail(two);
+    expect(orders.map((o) => [o.orderId, o.labels[0], o.totalCents])).toEqual([
+      ['113-0000000-0000001', 'Hair Care', 1080],
+      ['113-0000000-0000002', 'Books', 2500],
+    ]);
+  });
+});
+
+describe('reading each copy of an email separately', () => {
+  // Since 2026-09-15 Amazon's plain-text copy carries its own "Order #" but no
+  // category line, and prints its total as an unrounded float. Glued into one
+  // document with the HTML copy, the category and the only readable total fell
+  // into different chunks and every shipment read as unrecognised.
+  const html = [
+    'Your package was shipped!', '1 Hair Care item', 'Order #', '113-2704312-9904237', 'Total', '  $10.80',
+  ].join('\n');
+  const plain = [
+    'Your package was shipped!', 'Order #', '113-2704312-9904237', 'Total', '10.799999999999999 USD',
+  ].join('\n');
+
+  it('takes the category from the copy that has it and checks the totals agree', () => {
+    expect(parseAmazonEmail({ subject: 'Shipped 1 item: Hair Care', plain, html })).toEqual([{
+      orderId: '113-2704312-9904237', kind: 'shipped', totalCents: 1080, itemCount: 1, labels: ['Hair Care'],
+    }]);
+  });
+
+  it('refuses an order whose copies state different totals', () => {
+    const wrong = plain.replace('10.799999999999999', '12.50');
+    expect(classifyAmazonEmail({ subject: 'Shipped 1 item: Hair Care', plain: wrong, html }).status)
+      .toBe('unrecognised');
+  });
+
+  it('falls back to the subject when no body copy names a category', () => {
+    const bare = html.replace('1 Hair Care item\n', '');
+    expect(parseAmazonEmail({ subject: 'Shipped 1 item: Hair Care', plain, html: bare })[0].labels)
+      .toEqual(['Hair Care']);
+  });
+
+  it('marks a subject list ending "and more" as partial', () => {
+    const bare = html.replace('1 Hair Care item\n', '');
+    const [order] = parseAmazonEmail({
+      subject: 'Shipped 4 items: Electronics, Irons & Steamers, and more', plain, html: bare,
+    });
+    expect(order).toMatchObject({ itemCount: 4, labels: ['Electronics', 'Irons & Steamers'], partial: true });
+  });
+
+  it('takes the email type from the subject verb', () => {
+    const neutral = html.replace('Your package was shipped!\n', '');
+    expect(parseAmazonEmail({ subject: 'Shipped 1 item: Hair Care', html: neutral })[0].kind).toBe('shipped');
+  });
+
+  it('prefers the grand total when a copy also states a per-shipment total', () => {
+    const [order] = parseAmazonEmail({
+      html: ['Thanks for your order!', '1 Books item', 'Order #', '113-0000000-0000009', 'Total $5.00', 'Grand Total: $9.54'].join('\n'),
+    });
+    expect(order.totalCents).toBe(954);
+  });
+
+  const htmlTwo = [
+    'Thanks for your order!',
+    '1 Hair Care item', 'Order # 113-0000000-0000001', 'Grand Total:', '$10.80',
+    '2 Books items', 'Order # 113-0000000-0000002', 'Grand Total:', '$25.00',
+  ].join('\n');
+  const plainTwo = (second: string) => [
+    'Thanks for your order!',
+    'Order # 113-0000000-0000001', 'Grand Total:', '10.80 USD',
+    'Order # 113-0000000-0000002', 'Grand Total:', `${second} USD`,
+  ].join('\n');
+
+  it('pairs several orders inside one copy when the other copy agrees', () => {
+    expect(parseAmazonEmail({ html: htmlTwo, plain: plainTwo('25.00') }).map((o) => [o.orderId, o.totalCents]))
+      .toEqual([['113-0000000-0000001', 1080], ['113-0000000-0000002', 2500]]);
+  });
+
+  it('counts a multi-order email as unreadable when another copy contradicts one order', () => {
+    // Dropping just the contradicted order would mark the message read with no
+    // warning and no sample — a layout change hidden behind the orders that
+    // still parsed. The whole message stays unread instead, and is sampled.
+    expect(classifyAmazonEmail({ html: htmlTwo, plain: plainTwo('26.00') }))
+      .toEqual({ orders: [], status: 'unrecognised' });
+  });
+});
+
+describe('cancellation notices', () => {
+  const CANCELLED = {
+    subject: 'Item cancelled successfully: "Example item..."',
+    plain: [
+      'Your items were cancelled',
+      'Your order was cancelled. You have not been charged for this order.',
+      'Order #', '113-2018846-2323410', 'Quantity: 1', '8.39 USD',
+    ].join('\n'),
+  };
+
+  it('skips a cancellation and names the order it cancels', () => {
+    expect(classifyAmazonEmail(CANCELLED)).toEqual({
+      orders: [], status: 'ignored', cancelledOrderIds: ['113-2018846-2323410'],
+    });
+  });
+
+  it('does not take an unreadable order email for a cancellation because it mentions one', () => {
+    // A confirmation in a layout the parser cannot read yet that happens to
+    // mention cancelling. Skipping it as a cancellation would mark it read with
+    // no warning — the 2026-08 delivery-notice failure again.
+    expect(classifyAmazonEmail({
+      subject: 'Ordered 1 item: Hair Care',
+      plain: 'Thanks for your order!\nOrder # 113-0000000-0000004\nIf an item has been cancelled, you will not be charged.\nOrder total 10,80 €',
+    }).status).toBe('unrecognised');
+  });
+
+  it('does not skip a cancellation notice that states a total', () => {
+    // A total means money moved (a refund, a part-cancelled order): not the
+    // nothing-was-charged notice this skip exists for.
+    expect(classifyAmazonEmail({
+      subject: 'Item cancelled successfully: "Example item..."',
+      plain: 'Your order was cancelled.\nOrder # 113-0000000-0000005\nRefund Total: $8.39',
+    }).status).toBe('unrecognised');
+  });
+
+  it('still reads the order in a shipment that mentions a cancelled item', () => {
+    const r = classifyAmazonEmail(
+      'Your package was shipped!\nOne item was cancelled.\nOrder # 113-0000000-0000003\n1 Books item\nTotal $12.00',
+    );
+    expect(r.status).toBe('orders');
+    expect(r.cancelledOrderIds).toBeUndefined();
   });
 });

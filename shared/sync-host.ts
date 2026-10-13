@@ -1,6 +1,7 @@
 import type { AccountMapping, MappingRule, SimplefinAccountSet, UnmappedAccount } from './types.js';
 import type { AmazonLedger } from './amazon-ledger.js';
 import type { HoldingsSnapshot } from './holdings.js';
+import type { SkippedTransaction } from './skipped-transactions.js';
 
 /** A Wealthfolio activity row, normalized across the SDK and REST shapes. */
 export interface HostActivity {
@@ -19,6 +20,11 @@ export interface HostActivity {
   /** A rule-assigned classifier (e.g. 'REIMBURSEMENT'), or `null` when the
    *  host reports the row has none. See docs/upstream-spending-buckets.md. */
   subtype?: string | null;
+  /** The row's stored metadata — a JSON string, or the parsed object some
+   *  reads return. `null` when the host reports the row has none; ABSENT when
+   *  the host cannot report it at all, which callers must treat as "unknown",
+   *  never as "none" (see `flowExternalOf` in sync-core). */
+  metadata?: string | Record<string, unknown> | null;
 }
 
 export interface TransferLinkFailureEntry {
@@ -303,4 +309,12 @@ export interface SyncStore {
    * behaviour.
    */
   getBalanceIncludesHoldings?(): Promise<string[]>;
+  /**
+   * Bank transactions the user has said are not real — a feed's second copy of
+   * one transaction (see shared/skipped-transactions.ts). Never imported.
+   *
+   * Optional like the getters above; a host without it imports everything, which
+   * is what it did before the list existed.
+   */
+  getSkippedTransactions?(): Promise<SkippedTransaction[]>;
 }

@@ -28,7 +28,8 @@
  * ledger of when each condition was first observed, and everything about WHEN
  * to speak is decided here, where it can be tested without a database.
  */
-import type { SelfCheckFinding } from './self-check.js';
+import type { SelfCheckFinding, FindingFix } from './self-check.js';
+import { formatDollars, shortDate } from './telegram.js';
 
 export interface LedgerFacts {
   /** `YYYY-MM`, so once-a-month findings re-arm when the month turns. */
@@ -36,7 +37,12 @@ export interface LedgerFacts {
   /** Credit cards only. Cash accounts already have drift episodes; a card never
    *  could, because Wealthfolio reports no valuation for one. `ledger` is the
    *  POSTED balance, which is what the bank's figure means too. */
-  cardBalances: Array<{ name: string; ledger: number; bank: number | null; inFlight: boolean }>;
+  cardBalances: Array<{
+    /** The Wealthfolio account id — what tells the daily findings which
+     *  accounts this check already covers. Optional for older fixtures. */
+    wfId?: string;
+    name: string; ledger: number; bank: number | null; inFlight: boolean;
+  }>;
   /** Refund-type credits with no spending category: they reduce nothing. */
   idleRefunds: Array<{ id: string; description: string; amount: number }>;
   /** Cash deposits filed under an INCOME category named like a payback. */
@@ -58,6 +64,16 @@ export interface LedgerFacts {
   }>;
   /** Categories over budget in each of the last N full months. */
   chronicallyOver: Array<{ name: string; months: number; averageOver: number }>;
+  /** Unlinked transfer legs whose other half never reached the ledger: exactly
+   *  one other account is off from its bank balance by the leg's amount, in the
+   *  direction the money went. */
+  missingLegs: Array<{ id: string; description: string; amount: number; date: string; fromAccount: string; toAccount: string }>;
+  /** Cards whose opening balance says they started in credit. */
+  cardsOpenedInCredit: Array<{ name: string; amount: number; date: string }>;
+  /** Legs of a detected transfer pair the sync failed to link three times
+   *  (its `transfer_link_failures` ledger), still unlinked in the database —
+   *  on any account, at any age. Optional for older fixtures. */
+  stuckTransfers?: Array<{ id: string; description: string; amount: number; date: string; account: string }>;
 }
 
 /** When each condition was FIRST observed, keyed as `evaluateLedgerChecks`
@@ -82,10 +98,10 @@ const ONCE_VISIBLE_MS = 86_400_000;
 /** One purchase has to be worth mentioning in absolute terms too, or a $10
  *  parking budget files a report over a $12 ticket. */
 const BUDGET_BUSTER_FLOOR = 50;
-/** The digest was called bloated once already. */
-const MAX_LINES = 5;
 
-const money = (n: number) => `$${Math.abs(n).toFixed(2)}`;
+const money = (n: number) => formatDollars(Math.abs(n), 2);
+/** A button has room for ~40 characters; a bank descriptor can run to 60. */
+const short = (text: string, max = 18) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
 interface Candidate {
   key: string;
@@ -106,29 +122,61 @@ export function evaluateLedgerChecks(
   now: Date,
 ): { findings: SelfCheckFinding[]; keys: string[] } {
   const candidates: Candidate[] = [];
-  const warn = (message: string): SelfCheckFinding => ({ kind: 'ledger', severity: 'warning', message });
+  const warn = (message: string, label: string, fix?: FindingFix): SelfCheckFinding => ({
+    kind: 'ledger', severity: 'warning', message, label, ...(fix ? { fix } : {}),
+  });
 
   // ── ledger errors: these have a right answer ─────────────────────────────
   for (const g of facts.groupedNonTransfers) {
     candidates.push({
       key: `grouped-non-transfer:${g.id}`,
       when: 'always',
-      finding: warn(`${g.description} (${money(g.amount)}) is linked as a transfer but typed ${g.type}, so it still counts — retype it as a transfer`),
+      finding: warn(
+        `${g.description} (${money(g.amount)}) is linked as a transfer but typed ${g.type}, so it still counts — make it a transfer`,
+        `${short(g.description)} ${money(g.amount)} counts as ${g.type === 'DEPOSIT' ? 'income' : 'spending'}`,
+        { kind: 'make-transfer', activityId: g.id, description: g.description, amount: g.amount, activityType: g.type },
+      ),
     });
   }
+  // A leg whose other half is provably MISSING gets the sharper message below;
+  // "link it to its other half" would send the user looking for a row that
+  // does not exist.
+  const missingIds = new Set((facts.missingLegs ?? []).map((m) => m.id));
+  const namedIds = new Set(missingIds);
   for (const t of facts.unlinkedTransfers) {
-    if (t.ageDays < UNLINKED_MIN_AGE_DAYS) continue;
+    if (t.ageDays < UNLINKED_MIN_AGE_DAYS || missingIds.has(t.id)) continue;
+    namedIds.add(t.id);
     candidates.push({
       key: `unlinked-transfer:${t.id}`,
       when: 'always',
-      finding: warn(`${t.description} (${money(t.amount)}) is an unlinked transfer, so Wealthfolio counts it as ${t.direction === 'in' ? 'income' : 'spending'} — link it to its other half`),
+      finding: warn(
+        `${t.description} (${money(t.amount)}) is an unlinked transfer, so Wealthfolio counts it as ${t.direction === 'in' ? 'income' : 'spending'} — link it to its other half`,
+        `${short(t.description)} ${money(t.amount)} unlinked`,
+      ),
+    });
+  }
+  // What the separate "Transfer stuck" alert said, once the daily report
+  // carries it (1.57.1) — only where nothing above already names the leg.
+  for (const t of facts.stuckTransfers ?? []) {
+    if (namedIds.has(t.id)) continue;
+    candidates.push({
+      key: `stuck-transfer:${t.id}`,
+      when: 'always',
+      finding: warn(
+        `${t.description} (${money(t.amount)}, ${t.account}, ${shortDate(t.date)}) could not be linked to its other half after 3 tries — run Deep scan, or link the pair in Wealthfolio`,
+        `${short(t.description)} ${money(t.amount)} won't link`,
+      ),
     });
   }
   for (const r of facts.idleRefunds) {
     candidates.push({
       key: `idle-refund:${r.id}`,
       when: 'always',
-      finding: warn(`${r.description} (${money(r.amount)}) is a refund with no spending category, so it reduces nothing — give it one`),
+      finding: warn(
+        `${r.description} (${money(r.amount)}) is a refund with no spending category, so it reduces nothing — give it one`,
+        `${short(r.description)} ${money(r.amount)} no category`,
+        { kind: 'pick-category', activityId: r.id },
+      ),
     });
   }
   for (const c of facts.cardBalances) {
@@ -140,14 +188,30 @@ export function evaluateLedgerChecks(
       // days rather than inherit the age of a different one.
       key: `card-balance:${c.name}:${Math.round(Math.abs(diff) * 100)}`,
       when: 'after-grace',
-      finding: warn(`${c.name} has been ${money(diff)} ${diff > 0 ? 'above' : 'below'} the bank's balance for over two days`),
+      finding: warn(
+        `${c.name} has been ${money(diff)} ${diff > 0 ? 'above' : 'below'} the bank's balance for over two days`,
+        `${short(c.name)} off by ${money(diff)}`,
+      ),
+    });
+  }
+  for (const m of facts.missingLegs ?? []) {
+    candidates.push({
+      key: `missing-leg:${m.id}`,
+      when: 'always',
+      finding: warn(
+        `${m.description} (${money(m.amount)}) left ${m.fromAccount} on ${shortDate(m.date)} but never arrived: ${m.toAccount} is exactly ${money(m.amount)} off from its bank balance. The feed dropped the other half — run fix-transfers to add it and link the pair`,
+        `${short(m.description)} ${money(m.amount)} never arrived`,
+      ),
     });
   }
   if (facts.needsReview > 0) {
     candidates.push({
       key: 'needs-review',
       when: 'always',
-      finding: warn(`${facts.needsReview} transaction${facts.needsReview === 1 ? '' : 's'} flagged Needs review in Wealthfolio`),
+      finding: warn(
+        `${facts.needsReview} transaction${facts.needsReview === 1 ? '' : 's'} flagged Needs review in Wealthfolio`,
+        `${facts.needsReview} flagged Needs review`,
+      ),
     });
   }
 
@@ -156,7 +220,10 @@ export function evaluateLedgerChecks(
     candidates.push({
       key: `income-reimbursement:${d.id}`,
       when: 'once',
-      finding: warn(`${d.description} (${money(d.amount)}) is filed under "${d.category}", an income category — it counts as income and offsets no spending. If it paid you back for something, make it a reimbursement credit in that purchase's category`),
+      finding: warn(
+        `${d.description} (${money(d.amount)}) is filed under "${d.category}", an income category — it counts as income and offsets no spending. If it paid you back for something, make it a reimbursement credit in that purchase's category`,
+        `${short(d.description)} ${money(d.amount)} filed as income`,
+      ),
     });
   }
   for (const c of facts.categories) {
@@ -166,14 +233,30 @@ export function evaluateLedgerChecks(
     candidates.push({
       key: `budget-buster:${big.id}`,
       when: 'once',
-      finding: warn(`${big.description} (${money(big.amount)}) is bigger than the whole ${c.name} budget (${money(c.budget)}) — reimbursable, a one-off, or time to raise the budget?`),
+      finding: warn(
+        `${big.description} (${money(big.amount)}) is bigger than the whole ${c.name} budget (${money(c.budget)}) — reimbursable, a one-off, or time to raise the budget?`,
+        `${short(big.description, 18)} > ${short(c.name, 14)} budget`,
+      ),
     });
   }
   for (const c of facts.chronicallyOver) {
     candidates.push({
       key: `chronic:${facts.month}:${c.name}`,
       when: 'once',
-      finding: warn(`${c.name} has been over budget ${c.months} months running, by about ${money(c.averageOver)} a month — the budget may be the thing that is wrong`),
+      finding: warn(
+        `${c.name} has been over budget ${c.months} months running, by about ${money(c.averageOver)} a month — the budget may be the thing that is wrong`,
+        `${short(c.name)} over ${c.months} months running`,
+      ),
+    });
+  }
+  for (const c of facts.cardsOpenedInCredit ?? []) {
+    candidates.push({
+      key: `card-opened-in-credit:${c.name}`,
+      when: 'once',
+      finding: warn(
+        `${c.name}'s opening balance says it started ${money(c.amount)} in credit on ${shortDate(c.date)}. A card in use rarely does — an opening balance computed from the bank's figure silently absorbs any payment the feed never delivered. Check the card's payment history against its Wealthfolio payments`,
+        `${short(c.name)} opened in credit`,
+      ),
     });
   }
   for (const h of facts.heldTransfers) {
@@ -181,7 +264,10 @@ export function evaluateLedgerChecks(
     candidates.push({
       key: `held-transfer:${h.id}`,
       when: 'once',
-      finding: warn(`${h.description} (${money(h.amount)}) has waited ${h.ageDays} days for its other half — a silent bank feed is holding it open`),
+      finding: warn(
+        `${h.description} (${money(h.amount)}) has waited ${h.ageDays} days for its other half — a silent bank feed is holding it open`,
+        `${short(h.description)} ${money(h.amount)} still in transit`,
+      ),
     });
   }
 
@@ -193,15 +279,14 @@ export function evaluateLedgerChecks(
     return age !== null && age >= CARD_MISMATCH_GRACE_MS;
   });
 
-  const findings = due.map((c) => c.finding);
-  if (findings.length > MAX_LINES) {
-    const hidden = findings.length - (MAX_LINES - 1);
-    findings.splice(MAX_LINES - 1, findings.length, {
-      kind: 'ledger',
-      severity: 'warning',
-      message: `…and ${hidden} more ledger issue${hidden === 1 ? '' : 's'}`,
-    });
-  }
+  // No cap any more. There used to be one (five lines, then "…and N more"),
+  // because these printed straight into the morning report, and the tail it
+  // hid could not be reached at all. The report now prints only a COUNT, with
+  // the whole list a tap away, so every due finding is returned — and every
+  // once-only one is genuinely announced the day it is stamped.
+  //
+  // The key rides on the finding so a snooze and a tapped button can name it.
+  const findings = due.map((c) => ({ ...c.finding, key: c.key }));
   return { findings, keys: candidates.map((c) => c.key) };
 }
 

@@ -50,6 +50,23 @@ describe('RestSyncHost', () => {
     expect(rows[1].fee ?? null).toBeNull();
   });
 
+  it('listActivities reports metadata as stored, and as UNKNOWN when the server sends no such field', async () => {
+    // The sync marks its own transfer rows external only when the flag is known
+    // to be unset. Reading "no field" as null would re-stamp every row on every
+    // sync against a server that cannot report metadata.
+    const client = {
+      searchActivities: vi.fn(async () => [
+        { id: 'marked', accountId: 'wf-a', activityType: 'TRANSFER_IN', date: '2026-04-18', amount: '1', metadata: { flow: { is_external: true } } },
+        { id: 'none', accountId: 'wf-a', activityType: 'TRANSFER_IN', date: '2026-04-18', amount: '1', metadata: null },
+        { id: 'older-server', accountId: 'wf-a', activityType: 'TRANSFER_IN', date: '2026-04-18', amount: '1' },
+      ]),
+    } as any;
+    const rows = await new RestSyncHost(client).listActivities('wf-a');
+    expect(rows[0].metadata).toEqual({ flow: { is_external: true } });
+    expect(rows[1].metadata).toBeNull();
+    expect('metadata' in rows[2]).toBe(false);
+  });
+
   it('links a pair by deleting and re-creating both legs via saveMany, returning the echoed groupId', async () => {
     const client = {
       saveMany: vi.fn(async (req: any) => ({
@@ -231,6 +248,17 @@ describe('RestSyncStore', () => {
     await store.setLastSyncAt(new Date('2026-07-01T12:00:00Z'));
     expect(client.setAddonSecret).toHaveBeenCalledWith('simplefin-sync', 'last_sync_at', '2026-07-01T12:00:00.000Z');
     expect(await store.getLastSyncAt()).toEqual(new Date('2026-07-01T12:00:00Z'));
+  });
+
+  it('reads the skip list the addon shares, dropping malformed entries', async () => {
+    const secrets = new Map<string, string>([
+      ['skipped_transactions', JSON.stringify([{ account: 'sfin-1', txId: 'TRN-1' }, 'junk'])],
+    ]);
+    const client = {
+      getAddonSecret: vi.fn(async (_addonId: string, key: string) => secrets.get(key) ?? null),
+      setAddonSecret: vi.fn(),
+    } as any;
+    expect(await new RestSyncStore(client).getSkippedTransactions()).toEqual([{ account: 'sfin-1', txId: 'TRN-1' }]);
   });
 
   it('reads and writes transfer link failures as JSON', async () => {

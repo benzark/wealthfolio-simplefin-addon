@@ -5,6 +5,7 @@ import { AMAZON_CONFIG_SECRET_KEY, AMAZON_LABELS_SECRET_KEY } from './amazon-mai
 import type { AmazonLabelCatalog, AmazonMailConfig } from './amazon-mail.js';
 import type { AmazonLedger } from '../../shared/amazon-ledger.js';
 import { linkPairByRecreate } from '../../shared/link-pair.js';
+import { SKIPPED_TRANSACTIONS_SECRET_KEY, parseSkippedTransactions, type SkippedTransaction } from '../../shared/skipped-transactions.js';
 import type { WealthfolioClient } from './wealthfolio.js';
 import type {
   HostActivity,
@@ -38,6 +39,10 @@ function fromSearchItem(a: any, wfAccountId = ''): HostActivity {
     assetId: a.assetId ? String(a.assetId) : undefined,
     sourceGroupId: a.sourceGroupId ?? null,
     subtype: a.subtype ?? null,
+    // Passed through as-is, and ABSENT (not null) when the response has no
+    // such field: an older server that cannot report metadata must read as
+    // "unknown", or the sync would re-stamp its rows on every run.
+    ...('metadata' in a ? { metadata: a.metadata ?? null } : {}),
   };
 }
 
@@ -306,6 +311,12 @@ export class RestSyncStore implements SyncStore {
   async getIgnoredAccounts(): Promise<string[]> {
     const list = await this.getJson<unknown>('ignored_accounts');
     return Array.isArray(list) ? (list as string[]) : [];
+  }
+
+  /** Read-only, like the ignored accounts: the list is written by the addon or a
+   *  companion tool, and honoured here (see shared/skipped-transactions.ts). */
+  async getSkippedTransactions(): Promise<SkippedTransaction[]> {
+    return parseSkippedTransactions(await this.client.getAddonSecret(this.addonId, SKIPPED_TRANSACTIONS_SECRET_KEY));
   }
 
   async getAmazonLedger(): Promise<AmazonLedger> {

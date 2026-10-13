@@ -1,6 +1,7 @@
 import type { AccountMapping, MappingRule, SimplefinAccountSet } from './types.js';
 import type { AmazonLedger } from './amazon-ledger.js';
 import type { HoldingsSnapshot } from './holdings.js';
+import type { SkippedTransaction } from './skipped-transactions.js';
 import type {
   ActivityWrite,
   HostActivity,
@@ -69,6 +70,22 @@ export interface FakeHostSeed {
    *  valuations API omits. Absent means the host lacks the capability, which is
    *  the addon's shape. */
   ledgerBalances?: Map<string, number>;
+  /**
+   * Model two Wealthfolio 3.8 write rules that only do damage together
+   * (activities_service.rs), off by default so older tests keep their simpler host:
+   *  - An update to one leg of a linked transfer (exactly two rows sharing a
+   *    group, one TRANSFER_IN and one TRANSFER_OUT) copies its date, note and
+   *    amount onto the other leg, unless the same request updates that leg too
+   *    (`build_counterpart_update`). The copy is echoed in `updated`, as the bulk
+   *    endpoint does. An update also keeps the stored group, as the server does.
+   *  - Every create is fingerprinted from account, type, date, amount and note;
+   *    a create whose fingerprint a stored row holds is refused with the server's
+   *    message, and an update never re-fingerprints a row (the repository keeps
+   *    `idempotency_key`).
+   */
+  upstreamWriteRules?: boolean;
+  /** The user's skip list (see shared/skipped-transactions.ts). */
+  skippedTransactions?: SkippedTransaction[];
 }
 
 export interface FakeHost {
@@ -155,6 +172,18 @@ export function createFakeHost(seed: FakeHostSeed = {}): FakeHost {
     return rows;
   }
 
+  /** Wealthfolio 3.8 accepts only these types on a credit card, on every write
+   *  path (activities_service.rs, `account_activity_validation_message`). Live
+   *  refusal 2026-09-23: "TRANSFER_OUT activities are not supported for credit
+   *  card accounts". Enforced here so a test cannot pass on a write the real
+   *  server would refuse. */
+  function cardRefusal(accountId: string, activityType: string): string | null {
+    if (accountTypes[accountId] !== 'CREDIT_CARD') return null;
+    return ['WITHDRAWAL', 'TRANSFER_IN', 'CREDIT', 'FEE', 'INTEREST'].includes(activityType)
+      ? null
+      : `Invalid data: ${activityType} activities are not supported for credit card accounts`;
+  }
+
   function toHostActivity(id: string, w: ActivityWrite): HostActivity {
     return {
       id,
@@ -173,7 +202,18 @@ export function createFakeHost(seed: FakeHostSeed = {}): FakeHost {
       // exact same "backfill" update forever, which is invisible unless a test
       // reads a row back through this function rather than a hand-seeded one.
       subtype: w.subtype ?? null,
+      metadata: w.metadata ?? null,
     };
+  }
+
+  /** Wealthfolio's update semantics for metadata (activities_service.rs,
+   *  `merge_metadata_patch`): an update that omits it keeps what is stored,
+   *  and one that sends it merges its top-level keys over the stored object. */
+  function mergedMetadata(prev: HostActivity | undefined, patch: string | undefined): HostActivity['metadata'] {
+    const before = prev?.metadata;
+    if (patch === undefined) return before ?? null;
+    const base = typeof before === 'string' ? JSON.parse(before) : before ?? {};
+    return JSON.stringify({ ...base, ...JSON.parse(patch) });
   }
 
   /** Echo a row the way the real Wealthfolio API does: `comment` mirrored under `notes`. */
@@ -186,6 +226,27 @@ export function createFakeHost(seed: FakeHostSeed = {}): FakeHost {
   const accountOfId = new Map<string, string>();
   for (const [accountId, rows] of activities) {
     for (const row of rows) accountOfId.set(row.id, accountId);
+  }
+
+  const upstream = seed.upstreamWriteRules ?? false;
+  const fingerprint = (accountId: string, type: string, date: string, amount: unknown, comment: unknown) =>
+    `${accountId}|${type}|${String(date).slice(0, 10)}|${Number(amount ?? 0)}|${comment ?? ''}`;
+  /** Row id → the fingerprint it was CREATED with. Never refreshed by an update. */
+  const fingerprints = new Map<string, string>();
+  if (upstream) {
+    for (const [accountId, rows] of activities) {
+      for (const r of rows) fingerprints.set(r.id, fingerprint(accountId, r.activityType, r.date, r.amount, r.comment));
+    }
+  }
+  /** The other leg of the linked transfer `rowId` belongs to, when its group is a valid pair. */
+  function linkedCounterpart(rowId: string): HostActivity | null {
+    const accountId = accountOfId.get(rowId);
+    const row = accountId ? rowsFor(accountId).find((r) => r.id === rowId) : undefined;
+    if (!row?.sourceGroupId) return null;
+    const group = [...activities.values()].flat().filter((r) => r.sourceGroupId === row.sourceGroupId);
+    const types = new Set(group.map((r) => r.activityType));
+    if (group.length !== 2 || !types.has('TRANSFER_IN') || !types.has('TRANSFER_OUT')) return null;
+    return group.find((r) => r.id !== rowId) ?? null;
   }
 
   let linkedGroups: Record<string, string> = {};
@@ -259,6 +320,28 @@ export function createFakeHost(seed: FakeHostSeed = {}): FakeHost {
     async saveMany(req: SaveManyRequest): Promise<SaveManyResult> {
       saved.push(req);
       seed.saveManyHook?.(req, saved.length - 1);
+      // The bulk endpoint is all-or-nothing: one refused row and nothing lands.
+      const refusals = [...(req.creates ?? []), ...(req.updates ?? [])]
+        .map((w) => cardRefusal(accountOfId.get(w.id ?? '') ?? w.accountId, w.activityType))
+        .filter((m): m is string => m !== null);
+      if (refusals.length) {
+        return { created: [], updated: [], errors: refusals.map((message) => ({ action: 'save', message })) };
+      }
+      if (upstream) {
+        const stored = new Map([...fingerprints].map(([id, key]) => [key, id]));
+        const dupes = (req.creates ?? [])
+          .map((w) => stored.get(fingerprint(w.accountId, w.activityType, w.activityDate, w.amount, w.comment)))
+          .filter((id): id is string => !!id);
+        if (dupes.length) {
+          return {
+            created: [], updated: [],
+            errors: dupes.map((id) => ({
+              action: 'create',
+              message: `Duplicate activity detected. A matching activity already exists (id: ${id}).`,
+            })),
+          };
+        }
+      }
       const created: HostActivity[] = [];
       const updated: HostActivity[] = [];
 
@@ -267,15 +350,22 @@ export function createFakeHost(seed: FakeHostSeed = {}): FakeHost {
         const row = toHostActivity(id, w);
         rowsFor(w.accountId).push(row);
         accountOfId.set(id, w.accountId);
+        if (upstream) fingerprints.set(id, fingerprint(w.accountId, w.activityType, w.activityDate, w.amount, w.comment));
         created.push(withNotes(row));
       }
 
+      const explicitlyUpdated = new Set((req.updates ?? []).map((w) => w.id).filter(Boolean));
       for (const w of req.updates ?? []) {
         if (!w.id) continue;
         const accountId = accountOfId.get(w.id) ?? w.accountId;
         const rows = rowsFor(accountId);
         const idx = rows.findIndex((r) => r.id === w.id);
-        const row = toHostActivity(w.id, w);
+        const counterpart = upstream && !explicitlyUpdated.has(linkedCounterpart(w.id)?.id) ? linkedCounterpart(w.id) : null;
+        const row = {
+          ...toHostActivity(w.id, w),
+          metadata: mergedMetadata(idx >= 0 ? rows[idx] : undefined, w.metadata),
+          ...(upstream && idx >= 0 ? { sourceGroupId: w.sourceGroupId ?? rows[idx].sourceGroupId } : {}),
+        };
         if (idx >= 0) {
           rows[idx] = row;
         } else {
@@ -283,6 +373,12 @@ export function createFakeHost(seed: FakeHostSeed = {}): FakeHost {
           accountOfId.set(w.id, accountId);
         }
         updated.push(withNotes(row));
+        if (counterpart) {
+          counterpart.date = w.activityDate;
+          counterpart.comment = w.comment ?? null;
+          if (w.amount !== undefined) counterpart.amount = w.amount;
+          updated.push(withNotes({ ...counterpart }));
+        }
       }
 
       for (const id of req.deleteIds ?? []) {
@@ -292,6 +388,7 @@ export function createFakeHost(seed: FakeHostSeed = {}): FakeHost {
         const idx = rows.findIndex((r) => r.id === id);
         if (idx >= 0) rows.splice(idx, 1);
         accountOfId.delete(id);
+        fingerprints.delete(id);
       }
 
       return { created, updated, errors: [] };
@@ -299,6 +396,10 @@ export function createFakeHost(seed: FakeHostSeed = {}): FakeHost {
 
     async importActivities(rows: ImportRow[]) {
       imported.push(rows);
+      for (const row of rows) {
+        const refusal = cardRefusal(row.accountId, row.activityType);
+        if (refusal) throw new Error(refusal);
+      }
       for (const row of rows) {
         const id = freshId();
         const hostRow: HostActivity = {
@@ -406,6 +507,9 @@ export function createFakeHost(seed: FakeHostSeed = {}): FakeHost {
     },
     async getAutoAdjust() {
       return autoAdjust;
+    },
+    async getSkippedTransactions() {
+      return seed.skippedTransactions ?? [];
     },
   };
 

@@ -18,6 +18,44 @@ export const UNCATEGORIZED_STATUS_SECRET_KEY = 'uncategorized_status';
  */
 export const AMAZON_MAIL_STATUS_SECRET_KEY = 'amazon_mail_status';
 
+/** What the companion publishes under `AMAZON_MAIL_STATUS_SECRET_KEY`. */
+export interface AmazonMailStatus {
+  /** Order emails the parser could not read on the last completed scan. */
+  unparsed: number;
+  /** When the companion last tried the mailbox. */
+  asOf: string;
+  /** The last run that found any mail at all; absent = none ever. */
+  lastMailAt?: string;
+  /** Present while the mailbox cannot be read (wrong password, host…). */
+  error?: string;
+}
+
+/**
+ * Up to five recent emails the parser could not read, personal details
+ * removed — what the Amazon card's "Show what couldn't be read" copies.
+ * Replaced on every completed scan, so it always matches
+ * `AmazonMailStatus.unparsed` and clears itself once a fix reads the mail.
+ * Left alone when the scan fails, like the status's count.
+ */
+export const AMAZON_MAIL_SAMPLES_SECRET_KEY = 'amazon_mail_samples';
+
+/** One unreadable email, each copy redacted and trimmed (shared/amazon-sample.ts). */
+export interface AmazonMailSample {
+  /** The message's own date. */
+  at: string;
+  /** Amazon's sender address; `<email>` for anything else. */
+  from?: string;
+  subject: string;
+  plain: string;
+  html: string;
+}
+
+/** What the companion publishes under `AMAZON_MAIL_SAMPLES_SECRET_KEY`. */
+export interface AmazonMailSamples {
+  asOf: string;
+  samples: AmazonMailSample[];
+}
+
 /**
  * The semester pool's computed `PoolStatus` (shared/pool.ts), republished by
  * the companion on every sync — the Overview tile renders it verbatim, which

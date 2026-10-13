@@ -180,6 +180,61 @@ const SYNC_BOOKKEEPING_EXCLUSION = `
       AND COALESCE(a.notes, '') NOT LIKE '${BALANCE_ADJUSTMENT_COMMENT_PREFIX}%'
       AND COALESCE(a.notes, '') NOT LIKE '${IN_TRANSIT_COMMENT_PREFIX}%'`;
 
+/**
+ * Only activities in accounts Wealthfolio tracks for spending — the scope it
+ * enforces on every category write (`ensure_activity_in_spending_scope`,
+ * crates/spending cash_activities/service.rs: "Activity account is not opted
+ * into spending tracking") and the only accounts its own totals read. Applied
+ * to every UNCATEGORIZED reader, because the categorized ones are scoped
+ * already: Wealthfolio never let those rows be filed outside it.
+ *
+ * Without it the needs-a-category list offered rows nobody could file — live
+ * 2026-10-10, six Robinhood cashback deposits failed on every attempt — and
+ * the digest counted spending Wealthfolio leaves out.
+ *
+ * Settings are read exactly as upstream reads them (settings/service.rs): no
+ * `spending.enabled` row means OFF, and a missing or unparsable account list
+ * means NO accounts. Wealthfolio files nothing in either state, so listing
+ * nothing is the matching answer, not a lost signal.
+ */
+const IN_SPENDING_SCOPE = `
+      AND (SELECT setting_value FROM app_settings WHERE setting_key = 'spending.enabled') = 'true'
+      AND a.account_id IN (
+        SELECT value FROM json_each((
+          SELECT CASE WHEN json_valid(setting_value) THEN setting_value ELSE '[]' END
+          FROM app_settings WHERE setting_key = 'spending.account_ids')))`;
+
+/**
+ * Not one half of a transfer whose other half already waits in another
+ * account: an UNLINKED transfer-typed row there — the sync's in-transit
+ * placeholder included — for the same amount to the cent, moving money the
+ * opposite way, within the pairing window (TRANSFER_MATCH_WINDOW_SECONDS, 5
+ * days). Applied to every uncategorized reader, like IN_SPENDING_SCOPE.
+ *
+ * Live 2026-10-10: a $691.29 card payment. The card's half was typed as an
+ * in-transit TRANSFER_IN, but PNC's half was still pending ("ACH DEBIT
+ * ROBINHOOD CCB") and pending rows are never paired, so it sat in the
+ * needs-a-category list as a $691 purchase, counted in the digest and one tap
+ * from being filed as spending.
+ *
+ * Read-only and self-limiting. Once the halves link both are transfers
+ * anyway; if they never do, the placeholder expires into a plain
+ * deposit/withdrawal after 10 days and the charge is listed again. The cost
+ * accepted: a genuine purchase of exactly the same amount within 5 days of an
+ * unrelated unlinked transfer is held back until that transfer links.
+ */
+const NOT_AWAITING_TRANSFER_HALF = `
+      AND NOT EXISTS (
+        SELECT 1 FROM activities b
+        WHERE b.account_id <> a.account_id
+          AND COALESCE(b.source_group_id, '') = ''
+          AND UPPER(b.activity_type) = CASE UPPER(a.activity_type)
+                WHEN 'WITHDRAWAL' THEN 'TRANSFER_IN'
+                WHEN 'DEPOSIT' THEN 'TRANSFER_OUT'
+                WHEN 'CREDIT' THEN 'TRANSFER_OUT' END
+          AND ROUND(ABS(CAST(b.amount AS REAL)) * 100) = ROUND(ABS(CAST(a.amount AS REAL)) * 100)
+          AND ABS(julianday(substr(b.activity_date, 1, 10)) - julianday(substr(a.activity_date, 1, 10))) <= 5)`;
+
 function spendingWhere(startInclusive: string, endExclusive: string): string {
   return `
     WHERE a.activity_date >= '${startInclusive}'
@@ -524,6 +579,8 @@ export function getNativeUncategorizedSpending(
       AND COALESCE(a.notes, '') NOT LIKE 'Starting balance · %'
       AND COALESCE(a.notes, '') NOT LIKE 'Balance adjustment · %'
       AND COALESCE(a.notes, '') NOT LIKE '↔️ In-transit transfer · %'
+      ${IN_SPENDING_SCOPE}
+      ${NOT_AWAITING_TRANSFER_HALF}
     ORDER BY a.activity_date DESC, a.id;
   `;
 
@@ -551,6 +608,41 @@ export function getNativeUncategorizedSpending(
       direction: (String(vals[6]) === 'out' ? 'out' : 'in') as 'in' | 'out',
       incomeEligible: String(vals[7]) === '1',
     };
+  });
+}
+
+/**
+ * Amazon charges the order emails have labelled (`· Amazon: <label>` in the
+ * note) whose spending category was set by a categorization RULE — the
+ * fallback `fileAmazonCharges` replaces with the label's category.
+ */
+export function getNativeRuleCategorizedAmazonRows(
+  dbPath: string,
+  startInclusive: string,
+  endExclusive: string,
+): Array<{ activityId: string; notes: string }> {
+  if (!dbPath || !existsSync(dbPath)) return [];
+  if (!validDateBounds(startInclusive, endExclusive)) return [];
+  const query = `
+    SELECT a.id, COALESCE(a.notes, '')
+    FROM activities a
+    JOIN activity_taxonomy_assignments ata ON a.id = ata.activity_id
+    WHERE ata.taxonomy_id = 'spending_categories'
+      AND LOWER(COALESCE(ata.source, '')) = 'rule'
+      AND COALESCE(a.notes, '') LIKE '%· Amazon:%'
+      AND a.activity_date >= '${startInclusive}'
+      AND a.activity_date < '${endExclusive}'
+    ORDER BY a.activity_date DESC, a.id;
+  `;
+  const rows = queryNativeDb<Record<string, unknown>>(
+    dbPath,
+    'rule-categorized-amazon',
+    query,
+    (parts) => (parts.length === 2 ? { c0: parts[0], c1: parts[1] } : null),
+  );
+  return rows.map((r) => {
+    const vals = Object.values(r);
+    return { activityId: String(vals[0]), notes: String(vals[1]) };
   });
 }
 
@@ -1051,6 +1143,8 @@ export function getNativeUncategorizedSpendingTotal(
       AND COALESCE(a.source_group_id, '') = ''
       ${dismissedClause}
       ${SYNC_BOOKKEEPING_EXCLUSION}
+      ${IN_SPENDING_SCOPE}
+      ${NOT_AWAITING_TRANSFER_HALF}
       AND (${SPENDING_SIGN}) > 0;
   `;
 
@@ -1238,6 +1332,8 @@ export function getNativeUncategorizedByMonthAccount(
       AND COALESCE(a.source_group_id, '') = ''
       ${excludedClause}
       ${SYNC_BOOKKEEPING_EXCLUSION}
+      ${IN_SPENDING_SCOPE}
+      ${NOT_AWAITING_TRANSFER_HALF}
       AND (${SPENDING_SIGN}) > 0
     GROUP BY month, account_id;
   `;
@@ -1295,6 +1391,8 @@ export function getNativeMerchantRows(
       AND a.activity_date < '${endExclusive}'
       AND ata.activity_id IS NULL
       AND COALESCE(a.source_group_id, '') = ''
+      ${IN_SPENDING_SCOPE}
+      ${NOT_AWAITING_TRANSFER_HALF}
       AND (${SPENDING_SIGN}) > 0;
   `;
   const rows = queryNativeDb<Record<string, unknown>>(
@@ -1432,6 +1530,8 @@ export function getNativeSpendDailyTotals(
         AND ata.activity_id IS NULL
         AND COALESCE(a.source_group_id, '') = ''
         ${excludedClause}
+        ${IN_SPENDING_SCOPE}
+      ${NOT_AWAITING_TRANSFER_HALF}
         AND (${SPENDING_SIGN}) > 0
     ) GROUP BY date;
   `;

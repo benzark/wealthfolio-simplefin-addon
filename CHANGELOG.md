@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.53.1] - 2026-09-21
-
 ### Fixed
 
 - **An investment account's balance no longer counts its own holdings twice.**
@@ -30,6 +28,465 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   codebase; if any holding is missing a usable `market_value`, or `balance`
   itself will not parse, it falls back to the raw (unmarked) figure rather
   than writing a guess.
+
+## [1.59.2] - 2026-10-10
+
+1.59.1 was tagged but never published: its CI run stopped on a test-file
+error before anything was built. This is the same fix.
+
+### Fixed
+
+- **The needs-a-category list only shows what Wealthfolio will let you file.**
+  Wealthfolio refuses a category on any transaction in an account it does not
+  track for spending, so those rows sat in the list and in Telegram's count,
+  and every attempt to file one failed. They are now left out of the list, the
+  count, the digest's uncategorized total and the charts, matching
+  Wealthfolio's own totals. With spending tracking off the list is empty,
+  because Wealthfolio files nothing then.
+- **A card payment still pending at the bank no longer asks for a category.**
+  While one half of a transfer is pending the sync cannot pair it, so it looked
+  like a purchase: nagged about, counted in the digest, and one tap from being
+  filed as spending. A transaction is now left out of the list, the count and
+  the totals when its other half already waits in another account as a
+  transfer (same amount to the cent, the opposite direction, within 5 days).
+  Nothing is written, and if the halves never link the charge comes back to
+  the list once the other half's 10-day in-transit period ends.
+
+## [1.59.0] - 2026-10-10
+
+### Fixed
+
+- **Amazon's new shipment emails are read again.** Since mid-September Amazon
+  sends a plain-text copy with its own order number but no category, and
+  prints its total as `10.799999999999999 USD`. The parser joined that copy
+  with the HTML one and lost the order, so every shipment read as "could not
+  be read". It now reads the subject, plain text and HTML separately and
+  combines them by order number. An email with one order number (every
+  shipment notice) needs no layout logic at all, and an order whose copies
+  disagree on the total is skipped, never guessed.
+- **A charge imported before its email was readable gets its category.** The
+  sync only ever added the Amazon label when it first imported a charge, so a
+  charge that arrived during an outage stayed unlabelled for good. Each sync
+  now adds the label to such a charge's note — only to a note the sync wrote
+  and nobody edited, never to a linked transfer — and the charge is filed.
+- **Cancellation emails are skipped**, not reported as unreadable. They also
+  retire the cancelled order's confirmation, so a different charge for the
+  same amount cannot pick up its category. Only an email whose subject says
+  it was cancelled and that states no total counts — one that merely mentions
+  a cancelled item still has to parse, or it is reported.
+
+### Added
+
+- **"Show what couldn't be read"** on the Amazon card. The emails the parser
+  could not read, with email addresses, your name and delivery line, card
+  digits and link codes removed, ready to copy into a bug report (look it over
+  before posting it anywhere public). Each one becomes a test, so a fixed
+  format stays fixed.
+
+### Changed
+
+- **`/categorize` no longer offers "Make this a rule" for an Amazon purchase.**
+  A rule on `AMAZON MKTPL` would file every later Amazon charge the same way.
+  Prime, AWS and Kindle Unlimited charges still get the offer.
+- **Remove any catch-all Amazon rule** (for example `Amazon → Online
+  Shopping`). It files every Amazon charge before its order email is read, so
+  a charge whose email never parses silently keeps the rule's category instead
+  of reaching `/categorize`. Deleting a rule leaves the charges it already
+  filed as they are.
+
+## [1.58.0] - 2026-10-09
+
+### Fixed
+
+- **A linked transfer keeps both of its halves.** When the sync updated one
+  half of a linked transfer, Wealthfolio copied that half's date and note onto
+  the other — and the note is where the sync keeps each bank's transaction id.
+  The other half then read as the wrong bank's transaction, its own bank record
+  looked new, and every full sync reported it as "not imported" (or, if the
+  amount had changed, imported it a second time). Seen live on two card
+  payments and a savings transfer. Two changes:
+  - The sync no longer rewrites a half that is already linked just because its
+    partner fell outside this sync's date range. That rewrite — back into an
+    "in transit" placeholder, or after ten days into a plain deposit or
+    withdrawal — was what set the copying off. A bank's real change of amount
+    still goes through.
+  - A half that is carrying its partner's identity is recognised, and the pair
+    is re-linked with each half under its own bank's description, date and id.
+    The bank's own record is no longer offered as a new transaction.
+- **A transaction your own rule types as a transfer links up with its other
+  half.** Rule-typed transactions were kept out of automatic pairing (so a
+  pairing could never override your choice), which also meant one a rule
+  called a transfer could never be linked: it waited "in transit", then after
+  ten days counted as spending. Pairing only adds the link now when your rule
+  already says "transfer" in the same direction; rules naming any other type
+  still keep the transaction out. Seen live on a $500 savings → checking move.
+- **A refused import names the row Wealthfolio matched it to,** in the
+  companion log, so a refusal can be traced instead of guessed at.
+
+### Added
+
+- **Skip list for transactions a bank reports twice.** Deleting the extra copy
+  by hand did not stick: the next sync imported it again. The sync now never
+  imports a transaction on the list (per account; nothing already stored is
+  deleted for you). `companion/tools/skip-transaction.mjs` adds one and deletes
+  its row, after a dry run that shows the account's balance against the bank's.
+
+## [1.57.1] - 2026-10-09
+
+### Fixed
+
+- **Every stuck transfer reaches the daily report.** 1.57.0 folded the
+  "Transfer stuck" alert into the daily report, but the report only noticed
+  unlinked transfers on checking and savings accounts from the last 60 days.
+  It now reads the sync's record of pairs that failed to link three times and
+  names each leg that is still unlinked, on any account and at any age. A
+  pair you have since linked drops out on its own.
+- **A card with a transfer in flight is checked again.** The ledger's card
+  check skips such a card, and 1.57.0 also kept it out of the new
+  balance-difference finding, so a real mismatch said nothing until the
+  transfer cleared. The finding now covers it.
+- **No alert is lost on a morning the daily report cannot run.** If the
+  companion cannot find the Wealthfolio database, it sends the unmapped-account,
+  balance-difference and stuck-transfer messages itself, as before 1.57.
+- **Two accounts with the same name get separate findings.** Snoozing one
+  no longer silences the other, and each is labelled with the end of its id,
+  e.g. "CHECKING (…1111)". Accounts with unique names keep their snoozes.
+- **/left reads a number in a category's name as the name.** `/left travel
+  2026` looks up "Travel 2026" when that category exists, instead of asking
+  whether $2,026 of travel fits.
+- **The card menu's Pin and Range items have their old names back** for
+  screen readers ("Pin Cash flow", "Range for Cash flow").
+- **A fresh budget opens with the headline numbers across the top**, instead
+  of below the first two charts. Boards you have dragged or pinned keep their
+  positions.
+
+## [1.57.0] - 2026-10-09
+
+A minimalism release: three tabs, a calmer look, fewer settings, one Telegram
+voice, and a two-step setup.
+
+### Changed
+
+- **Three tabs instead of five: Home, Reports and Settings.**
+  - **Home** is what needs you: banners, unfinished setup, and a status strip.
+    The strip shows your accounts and whether any balance differs, what needs
+    a category, and the semester pool. The budget sits underneath.
+  - **Settings** is everything else, on one page, grouped: Accounts, Budget,
+    Notifications, Sync, Categorizing, Reset.
+  - The account balances moved into Settings → Accounts, beside the mapping.
+    Opening that card no longer contacts SimpleFin; only "Edit mapping" does.
+  - The pool editor moved to Settings → Budget. The pool tile on Home opens the
+    pool's burn-down.
+  - Your last-opened tab carries over.
+  - "Set up →" and the unmapped-account banner now open the right card and
+    scroll to it, instead of leaving you on a page of collapsed cards.
+  - The "Imported last run" tile is gone; the header already says how many
+    transactions the last sync imported.
+- **A calmer look ("Soft").** The addon now uses one visual system:
+  - **Type:** one type scale instead of 15 font sizes, and two weights.
+  - **Shape:** three corner radii, and one faint lift under surfaces instead of
+    a heavy drop shadow on every card.
+  - **Background:** the green glow behind the page is gone.
+  - **Tabs:** the tabs, the Reports sub-tabs and the Budget range chips are now
+    one segmented control.
+  - **Overview:** the stat tiles are one divided strip with no coloured rails,
+    and the accounts are one list instead of a stack of floating cards.
+  - **Banners:** they share one shape. Amber means "check this" (a balance
+    difference, duplicates removed); red is kept for real errors.
+  - **Colours:** they come from Wealthfolio's theme, so light and dark both
+    follow it. Chart colours are unchanged for now.
+- **Fewer settings.** One **Report detail** switch (Brief or Full) replaces
+  eight controls:
+  - Always on: the "$X left this month" line and the weekly pool section.
+  - Always allowed, and still only there to warn: the semester pool line and
+    the month-end forecast.
+  - Full only: the off-budget block in the daily report, and the cash runway
+    and subscriptions lines in the weekly one.
+  - Biggest spends in the weekly report: 5 in Full, 3 in Brief.
+
+  Existing setups read as **Full**, so nothing changes until you pick Brief. A
+  new setup starts on Brief. If you had switched one of the retired controls
+  off, it comes back.
+- **Auto-sync runs every 4, 6, 12 or 24 hours** (or off). Hourly is gone: the
+  SimpleFin bridge only refreshes every few hours. A stored value outside the
+  list still shows as its own option.
+- **Report content is shorter.** Weekly amounts per category, spent figures
+  when over budget, and subcategories are under **More options**.
+- **Long banners are one sentence**, with the rest under **Why?**: the
+  balance-difference and unmapped-account banners, the Amazon "no emails yet"
+  note, the pool card and the Spending Tracker note.
+- **The budget starts on six reports** in a fresh layout: the headline
+  numbers, cash flow (or the pool burn-down when a pool is set), category
+  trends (or cash flow), budget vs actual, top merchants and subscriptions.
+  A layout you already arranged keeps exactly what it had.
+- **+ Add report** lists the hidden reports, so bringing one back no longer
+  needs Customize. "Build your own…" opens the builder.
+- **Customize has one ⋯ button per card**, opening a menu (Edit, Duplicate,
+  Delete, Move, Size, Range, Colors, Hide) instead of seven buttons.
+- **Setup is two steps:** connect, then map accounts. Saving the mapping
+  finishes setup and turns on auto-sync every 6 hours. Rules start empty and
+  live in Settings.
+- **Without the companion, the budget shows a calm empty state** instead of a
+  warning. Its **Set up background sync** button opens Settings on the Docker
+  instructions.
+- **One Telegram voice.** While the daily report is on, three things stop
+  arriving as messages of their own and are listed in its "🧹 things to fix"
+  line instead:
+  - a SimpleFin account nothing is mapped to;
+  - a balance that differs from the bank, including the "waiting on the bank
+    feed" notice;
+  - a transfer that would not auto-link.
+
+  With the daily report off, they are sent exactly as before. So are the
+  addon's own alerts when no companion has synced in the last two days (an
+  addon-only install, or a stopped container), since then no daily report
+  will carry them. Imports,
+  large transactions, a day of failed syncs, refused imports, removed
+  duplicates and new Amazon labels still arrive straight away.
+- **One vocabulary in Telegram.**
+  - ✅ only means "synced". "On track", under-budget rows in the monthly
+    wrap-up, and "Nothing to fix" no longer carry it.
+  - Back buttons read "‹ Back" and undo buttons "↩ Undo".
+  - Amounts have thousands separators everywhere ($1,300.00, not $1300.00).
+  - Dates read "Oct 9", and times "Oct 9, 3:40 PM", instead of 2026-10-09,
+    10-09 or the container's locale format.
+- **The ☰ menu has seven commands:** /report, /left, /categorize, /charts,
+  /status, /sync and /help. /afford, /pool, /recategorize, /newrule and
+  /dismissed still work and are listed under "More commands" in /help.
+- **The pool tile says how long the pool lasts** ("lasts past Dec 12" or "out
+  by Nov 20"), and the Accounts tile says "all match the bank" only when every
+  balance was actually checked.
+- **The README** opens with what the addon does, a screenshot and three setup
+  steps. The store covers are new, rendered from the 1.57 UI with sample data.
+
+- **The daily report is shorter.** It now opens with only the categories
+  that need a decision today: over budget, over this week, or nearly out. The
+  rest become one line ("7 others on track"). Choose **All selected
+  categories** under Settings → Notifications → Daily category rows to get
+  every row back. The setting is stored under a new key, because earlier versions saved
+  "all" on every save whether you chose it or not.
+- **"Needs attention" no longer takes over the message.** Problems (a failing
+  sync, an unmapped account) still print in full. Everything else is one line,
+  "🧹 5 things to fix", with a **Show what to fix** button. The Reports tab
+  and push notifications still list every finding, since they have no button.
+- **The headline says what's left per day** ("about $74/day").
+- **The month-end forecast only speaks to warn.** It says "on pace to go
+  $X over", only from the 8th of the month. Before that it was a few days of
+  rent extrapolated, and it read as a contradiction next to "$X left".
+- **The semester pool leaves the daily report while it's healthy.** It
+  comes back when the pool is overspent or on pace to run out early. The
+  weekly check-in still carries the full section.
+- **An over-budget line no longer says the same figure twice.** When a
+  category was already over before this week, it reads "· nothing left this
+  wk" instead of repeating the month's overage as a weekly one.
+- **A dead bank feed is one finding per account**, so each can be snoozed
+  separately.
+
+### Added
+
+- **A balance-difference finding per account** in the daily report, for
+  accounts other than cards (cards already have their own check). It appears
+  only past your drift-alert threshold, never with drift alerts off. It says
+  which way and by how much, says it usually clears on its own while it is
+  young, and says it is more than feed lag after 10 days. It can be snoozed
+  like any other finding.
+- **/left groceries 20** answers "can I afford $20 of groceries", the same as
+  /afford 20 groceries.
+- **Fix and snooze from Telegram.** Show what to fix lists every finding.
+  Tapping one opens it, with:
+  - **Make it a transfer**, for a payment linked as a transfer but still
+    counting as spending. It goes through the usual rule preview: count, then
+    confirm, with Undo afterwards.
+  - **Pick a category**, for a refund that reduces nothing. It opens the
+    category picker on that one transaction.
+  - **Snooze 30 days**, for anything you already know about, such as a closed
+    card's dead feed. A snoozed finding comes back if it changes.
+  - **Unsnooze**, to bring snoozed findings back early.
+- **A stale tab now says so itself.** A banner at the top of the addon tells an
+  old tab to reload, or tells you to upload the new zip if the old one is still
+  installed. It re-checks every minute. The morning report no longer carries
+  the "a tab is still running vX" line. That line also fired when no tab was
+  open at all.
+- **Amazon mailbox problems show on the Amazon card.** That covers a failed
+  sign-in (wrong app password or address), and a mailbox the companion has read
+  but never found an Amazon email in. The second usually means the Gmail
+  filter's To field isn't empty. Both used to be visible only in
+  `docker logs`.
+- **Startup warnings** for a `WEALTHFOLIO_PASSWORD_FILE` that does not exist,
+  which used to fail later as a wrong password, and for an unset `TZ`, which
+  runs every schedule on UTC.
+- `companion/tools/audit-headline.mjs` is read-only. It measures each known
+  difference between the report's "$X left" and Wealthfolio's budget card:
+  - rows dated the 1st at midnight UTC,
+  - rows dated after today,
+  - sync bookkeeping rows,
+  - excluded categories,
+  - rows filed twice,
+  - uncategorized refunds.
+
+### Fixed
+
+- **A refused import is announced once.** Before, Wealthfolio refused the same
+  transaction on every sync and the "not imported" alert repeated every six
+  hours until the transaction left the bank feed. The companion and the addon
+  share one record of what was already announced.
+- `/report` stated the last sync time twice. It keeps the "failing since"
+  warning when a sync is failing.
+- In Settings → Notifications → Report content, each hint now sits under the setting it
+  explains. "These six apply immediately" was wrong (there are seven) and now
+  reads "These apply immediately".
+- The semester pool's inputs had no styling and were nearly invisible.
+- Three style classes the components used were never defined.
+- 🧹 now only means "things to fix"; the duplicates-removed notice uses 🗑️.
+- A reused SimpleFin setup token now explains that tokens are single-use,
+  instead of a bare "403". Text that isn't a setup token at all, such as an
+  access URL, is named as such.
+- Telegram bot tokens and chat IDs are trimmed on save. A pasted trailing
+  newline broke every API call, and the only error was "Not Found".
+- `/report` no longer marks a "say once" ledger finding as seen, so it can
+  no longer use one up before the 8am report.
+- `docker-compose.example.yml` now mounts the database folder (not the bare
+  `.db` file, which reads days stale) and sets `TZ`. The README's port now
+  matches Wealthfolio's default (8088).
+- Six tests with fixed dismissal dates started failing once those dates aged
+  past the 60-day pruning window. They now use dates relative to today.
+
+## [1.56.1] - 2026-09-24
+
+### Fixed
+
+- **Amazon's September order emails are read again.** Amazon moved the
+  category line ("1 Hair Care item") above the order number, and the parser
+  looked for it below. Every new order email was left unread as "could not be
+  read". Both layouts now parse, including emails with several orders.
+- **An order email's label now beats a categorization rule.** A broad rule
+  such as "Amazon → Online Shopping" files each charge on import, before the
+  email arrives, and used to decide the category for good. A rule's category is
+  now a fallback: the email's label replaces it. A category you chose yourself
+  is never touched. The daily-audit warning added in 1.56.0 about such rules is
+  gone, because the rule is harmless now.
+
+### Added
+
+- `companion/tools/amazon-unread.mjs` prints the Amazon emails the parser
+  could not read, exactly as the parser sees them. It is read-only and marks
+  nothing as read.
+
+## [1.56.0] - 2026-09-23
+
+### Added
+
+- **Reports tab.** Daily, Weekly and Monthly sub-tabs, each showing the
+  report as it stands right now and every edition that was sent before it.
+  The companion recomposes the live edition after each sync from the local
+  database, and archives each scheduled report whether or not Telegram is set
+  up. The daily history keeps about two months, weekly half a year, monthly two
+  years.
+- **Push notifications for reports.** On a Wealthfolio server that supports
+  Web Push, the companion pushes each scheduled report to every browser that
+  turned notifications on. Tapping it opens that report's sub-tab. A report you
+  switched off in Notifications is still archived, but not sent. Servers
+  without push support are skipped quietly.
+- **Two new daily-audit findings**, from problems found by hand:
+  - A transfer whose other half never arrived. The finding names the account
+    that is off from its bank by exactly that amount.
+  - A card whose opening balance says it started in credit. That usually
+    means the balance absorbed a payment the feed never delivered.
+- **Card opening debts are filed automatically.** The companion files a card's
+  opening debt under an "Opening balances" category excluded from spending,
+  creating both the category and the exclusion only if needed.
+
+### Fixed
+
+- **A dead bank feed no longer holds every transfer open.** A feed silent for
+  three weeks now holds only the transfers that name its account. Everything
+  else pairs or expires normally. The stale-feed warning now says what to do:
+  reconnect the feed in SimpleFin, or unmap a closed account.
+- **Amazon email setup.** A Google app password pasted with its display spaces
+  now works, for new and existing configs. If a categorization rule files every
+  Amazon charge before the order emails can label it, the daily audit says so
+  once.
+
+## [1.55.0] - 2026-09-23
+
+### Fixed
+
+- **A credit card that starts out owing money gets its opening balance.**
+  Wealthfolio 3.8 accepts only withdrawals, fees, interest, transfers in and
+  credits on a credit card. The addon wrote a card's opening debt, a negative
+  balance plug, and a restated old placeholder as a transfer out, which
+  Wealthfolio refuses. The write failed on every sync and the card's history
+  began at zero. These rows are now withdrawals.
+
+### Known limitation
+
+- Every money-out type Wealthfolio accepts on a card counts as spending. A
+  card's opening debt therefore appears on Wealthfolio's own Spending page on
+  its opening date, unless you file it under a category excluded from spending
+  (Settings → Spending). The addon's Budget tab and reports already leave it
+  out.
+
+## [1.54.0] - 2026-09-23
+
+### Fixed
+
+- **Wealthfolio's Health page no longer lists the addon's own rows as
+  "incomplete transfers".** Opening balances, balance plugs and in-transit
+  placeholders are stored as transfer legs because that is how they stay out of
+  spending. None of them has a partner, and Wealthfolio 3.8 reports every
+  unpartnered transfer leg as an error unless it is marked as money crossing
+  the portfolio boundary. Each sync now marks the addon's own such rows that
+  way, and new placeholders are written with the mark. Your own transfers and
+  linked pairs are never touched. Spending totals do not change.
+- **An account's early history no longer dips below zero.** When a re-scan
+  brought in transactions older than the starting balance, the addon corrected
+  the starting balance's amount but left its date alone, after the history it
+  stands for. Wealthfolio then replayed that history against an empty account
+  and reported "cash account had a negative balance". The starting balance now
+  moves to the day before the earliest transaction. Every sync checks this, so
+  a ledger corrected by an older version is repaired too. Only the date moves.
+- **A card's opening balance kept its sign when adjusted.** A card's opening
+  debt is stored as a transfer out, but it was read back as a positive amount.
+  Recovering an older charge would have turned the debt into a credit of the
+  same size. The same repair also no longer attaches a cash symbol to a
+  transfer-leg starting balance, which would have stopped it moving the balance.
+- **"Fix the starting balance" keeps the row's shape.** Accepting the offer
+  rewrote a cash opening balance as a deposit, which counted it as income again,
+  and on a card wrote a type the API refuses. It now writes the same shape the
+  sync uses for opening balances.
+- **The addon zip always carries the code for its version.** Packaging zipped
+  whatever `dist/addon.js` was already on disk. A locally built v1.53.0 zip
+  therefore shipped the v1.49.0 bundle, and the Sync page footer said so.
+  `npm run package` now builds first and refuses to pack a bundle compiled as a
+  different version. The zips attached to GitHub releases were built fresh by
+  CI and were not affected.
+
+### Added
+
+- `companion/tools/audit-health.mjs` shows the rows behind Wealthfolio's Health
+  and Spending pages, using Wealthfolio's own rules. It lists incomplete
+  transfers, late starting balances, rows on the phantom `$CASH` asset, spending
+  by month split into purchases, unlinked transfers and sync rows, and each
+  cash account against the bank. It also names the version compiled into the
+  installed addon. Read-only.
+- `companion/tools/fix-transfers.mjs` links the transfer legs Wealthfolio
+  reports as incomplete to their counterpart in another account, matched on the
+  same amount within five days. It retypes a counterpart stored as a deposit,
+  credit or withdrawal, and deletes the phantom `$CASH` asset once nothing
+  points at it. It acts only on matches that are unique both ways. Dry run by
+  default.
+
+## [1.53.1] - 2026-09-23
+
+### Fixed
+
+- **Findings the five-line cap hid were being marked as said.** On the first
+  morning after v1.53.0 the ledger checks had eleven things to say, showed four
+  and "…and 7 more" — and stamped all eleven as seen, so the seven once-only
+  findings nobody read expired without ever being shown. A finding the cap
+  hides is now left unstamped, so it takes its turn as the visible ones age
+  out. Always-on findings are stamped regardless (they repeat until fixed), and
+  a card mismatch keeps aging so a busy morning cannot reset its two-day clock.
 
 ## [1.53.0] - 2026-09-20
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { runSyncCore, applyBaselineFix, neutralAdjustmentFields, startingBalanceFields, expiredTransferLegType, VALUATION_POLL, IN_TRANSIT_TIMEOUT_SECONDS, descriptionFromComment, txIdFromComment, planDuplicatePrune, IN_TRANSIT_COMMENT_PREFIX, DUPLICATE_REFUSAL_LOG_TAG, INTERVAL_SKIP_MESSAGE } from './sync-core.js';
+import { runSyncCore, applyBaselineFix, neutralAdjustmentFields, startingBalanceFields, expiredTransferLegType, VALUATION_POLL, IN_TRANSIT_TIMEOUT_SECONDS, descriptionFromComment, txIdFromComment, planDuplicatePrune, planAmazonLateLabels, IN_TRANSIT_COMMENT_PREFIX, DUPLICATE_REFUSAL_LOG_TAG, INTERVAL_SKIP_MESSAGE } from './sync-core.js';
 import { createFakeHost, type FakeHostSeed } from './fake-host.js';
 import { accountTxKey } from './transfers.js';
 import { linkPairByRecreate } from './link-pair.js';
@@ -384,7 +384,7 @@ describe('runSyncCore', () => {
     // The table the 2026-08-27 refund would have failed: the ONE cell that
     // differs from the plug shape is a card inflow.
     expect(neutralAdjustmentFields('CREDIT_CARD', 429.71)).toEqual({ activityType: 'TRANSFER_IN', amount: 429.71, fee: 0 });
-    expect(neutralAdjustmentFields('CREDIT_CARD', -429.71)).toEqual({ activityType: 'TRANSFER_OUT', amount: 429.71, fee: 0 });
+    expect(neutralAdjustmentFields('CREDIT_CARD', -429.71)).toEqual({ activityType: 'WITHDRAWAL', amount: 429.71, fee: 0 });
     expect(neutralAdjustmentFields('CASH', 1300)).toEqual({ activityType: 'CREDIT', amount: 1300, fee: 0 });
     // Every outflow is a TRANSFER_OUT with its real amount: the only cash-moving
     // shape that survives Wealthfolio 3.8's final-cash contract (fee no longer
@@ -520,9 +520,10 @@ describe('runSyncCore', () => {
     expect(inflow.fee).toBe(0);
 
     const outflow = neutralAdjustmentFields('CREDIT_CARD', -1300);
-    // TRANSFER_OUT is Ignored on a card whatever else is true of it, and it is
-    // the shape whose amount still moves cash under Wealthfolio 3.8 (v1.49).
-    expect(outflow.activityType).toBe('TRANSFER_OUT');
+    // Not TRANSFER_OUT: Wealthfolio 3.8 refuses it on a card (live,
+    // 2026-09-23). Every outflow a card accepts is spending, so this is the
+    // honest one — see neutralAdjustmentFields.
+    expect(outflow.activityType).toBe('WITHDRAWAL');
     expect(outflow.amount).toBe(1300);
     expect(outflow.fee).toBe(0);
   });
@@ -611,6 +612,31 @@ describe('runSyncCore', () => {
     expect(create.amount).toBe(87.26);
     expect(create.fee ?? 0).toBe(0);
     expect(create.comment).toContain('↔️ In-transit transfer · ');
+  });
+
+  it('lets a long-dead feed hold only the legs that name it (v1.56)', async () => {
+    // Discover's feed died for good, and because ANY behind feed held EVERY
+    // expiring leg, a $3,000 Spend → Savings transfer sat as an in-transit
+    // placeholder for six weeks (live, 2026-09-23). A feed silent this long is
+    // disconnected, not late: it keeps holding the payment that names it, and
+    // nothing else.
+    const deadDiscover = {
+      id: 'sfin-2', name: 'Discover it Card', currency: 'USD', balance: '-500',
+      org: { name: 'Discover' },
+      'balance-date': Math.floor(Date.now() / 1000) - 60 * 86_400, transactions: [],
+    };
+    const seed = staleCounterpartSeed([deadDiscover]);
+    seed.accountSet!.accounts[0].transactions!.push({
+      id: 'tx-sav', posted: pastTimeoutEpoch(), amount: '-3000.00', description: 'Transfer to Capital One Transfers',
+    });
+    const { host, store, saved } = createFakeHost(seed);
+    await runSyncCore(host, store, { force: true });
+    const creates = saved.flatMap((r) => r.creates ?? []);
+    const payment = creates.find((c) => c.comment.includes('tx-disc'))!;
+    const transfer = creates.find((c) => c.comment.includes('tx-sav'))!;
+    expect(payment.comment).toContain('↔️ In-transit transfer · ');
+    expect(transfer.comment).not.toContain('In-transit');
+    expect(transfer).toMatchObject({ activityType: 'WITHDRAWAL', needsReview: true });
   });
 
   it('still expires a solo leg when every other mapped feed is caught up past the pairing window', async () => {
@@ -842,7 +868,10 @@ describe('runSyncCore', () => {
     expect(updates[0]).toMatchObject({
       id: 'sb-wf-a',
       accountId: 'wf-a',
-      activityType: 'DEPOSIT',
+      // A positive CASH baseline is a bare CREDIT since v1.52 — accepting the
+      // offer used to write DEPOSIT and quietly turn the opening balance back
+      // into income.
+      activityType: 'CREDIT',
       activityDate: '2023-11-01',
       amount: 10055.12,
       comment: 'Starting balance · sfin-1',
@@ -861,6 +890,20 @@ describe('runSyncCore', () => {
     expect(saved.flatMap((r) => r.updates ?? [])[0]).toMatchObject({
       activityType: 'WITHDRAWAL', amount: 42.5,
     });
+  });
+
+  it("keeps a card baseline in a shape the card accepts, with no cash symbol", async () => {
+    const seed = baselineOnlySeed();
+    seed.accountTypes = { 'wf-a': 'CREDIT_CARD' };
+    const { host, saved } = createFakeHost(seed);
+    await applyBaselineFix(host, {
+      wfAccountId: 'wf-a', sfAccountId: 'sfin-1', suggestedAmount: -235.4, currency: 'USD',
+    });
+    // DEPOSIT and TRANSFER_OUT are both refused on a card; the opening debt is
+    // a WITHDRAWAL (neutralAdjustmentFields).
+    const u = saved.flatMap((r) => r.updates ?? [])[0];
+    expect(u).toMatchObject({ activityType: 'WITHDRAWAL', amount: 235.4 });
+    expect(u.symbol).toBeUndefined();
   });
 
   it('writes nothing and reports failure when the account has no baseline row', async () => {
@@ -2266,17 +2309,16 @@ describe('runSyncCore with ONE SimpleFin tx id in two accounts', () => {
 
     // target − windowDelta − currentValuation, per account:
     //   Spend: 0 − (−700) − 0 = +700 → DEPOSIT
-    //   Citi:  0 − (+700) − 0 = −700 → TRANSFER_OUT
+    //   Citi:  0 − (+700) − 0 = −700 → WITHDRAWAL
     //
-    // The card side used to be a WITHDRAWAL, which this test froze in place —
-    // and on a card that classifies as SPENDING, so an opening balance booked a
-    // phantom purchase the size of the card's starting debt. A card's
-    // correction is now spending-neutral (see `startingBalanceFields`); the
-    // cash side is deliberately untouched.
+    // The card side went WITHDRAWAL → TRANSFER_OUT (v1.51, to stay out of
+    // spending) → WITHDRAWAL again (v1.55): Wealthfolio 3.8 refuses TRANSFER_OUT
+    // on a card, so the "neutral" shape never landed at all. Every outflow a
+    // card accepts is spending; see neutralAdjustmentFields.
     const baselines = imported.flat().filter((r) => r.comment.startsWith('Starting balance · '));
     expect(baselines.map((r) => [r.accountId, r.activityType, r.amount])).toEqual([
       ['wf-spend', 'CREDIT', 700],
-      ['wf-citi', 'TRANSFER_OUT', 700],
+      ['wf-citi', 'WITHDRAWAL', 700],
     ]);
   });
 
@@ -2445,6 +2487,25 @@ describe('runSyncCore + Amazon order categories', () => {
     );
     await runSyncCore(host, store, {});
     expect(saved[0].creates![0].comment).toBe('WHOLEFOODS #10251 · tx-amz');
+  });
+
+  it('adds the order category to a charge imported before its email was read', async () => {
+    // The gap behind the 2026-10 outage: reconciliation never compares notes,
+    // so a row that existed before its order email parsed kept the bare bank
+    // text forever, and no category ever reached it.
+    const { host, store, saved } = createFakeHost({
+      ...amazonSeed(ledgerFixture()),
+      existing: new Map([['wf-a', [{
+        id: 'act-amz', accountId: 'wf-a', activityType: 'WITHDRAWAL', date: '2026-08-06',
+        amount: 21.18, comment: 'AMAZON.COM*MB3T81 · tx-amz', sourceGroupId: null,
+      }]]]),
+    });
+    await runSyncCore(host, store, {});
+    const updates = saved.flatMap((s) => s.updates ?? []).filter((u) => u.id === 'act-amz');
+    expect(updates).toEqual([expect.objectContaining({
+      comment: 'AMAZON.COM*MB3T81 · Amazon: Lawn & Garden · tx-amz',
+      activityType: 'WITHDRAWAL', activityDate: '2026-08-06', amount: 21.18,
+    })]);
   });
 
   it('does nothing at all when the ledger is empty', async () => {
@@ -3326,6 +3387,17 @@ describe('legacy fee-side placeholders (pre-v1.49 CREDIT amount 0 / fee X)', () 
     expect(stored.find((r) => r.id === 'plug-1')).toMatchObject({ activityType: 'TRANSFER_OUT', amount: 80 });
   });
 
+  it('restates a card placeholder as a WITHDRAWAL, the outflow a card accepts', async () => {
+    // TRANSFER_OUT is refused on a card (Wealthfolio 3.8); the bulk call would
+    // fail and the row would keep booking $0 forever.
+    const s = seed([plug]);
+    s.accountTypes = { 'wf-a': 'CREDIT_CARD' };
+    const { host, store, activities } = createFakeHost(s);
+    const result = await runSyncCore(host, store, { force: true });
+    expect(result.errors.filter((e) => e.includes('legacy'))).toEqual([]);
+    expect(activities.get('wf-a')!.find((r) => r.id === 'plug-1')).toMatchObject({ activityType: 'WITHDRAWAL', amount: 80 });
+  });
+
   it('is idempotent: rows already in the new shape, or with no fee, are left alone', async () => {
     const already: HostActivity = { ...plug, id: 'done', activityType: 'TRANSFER_OUT', amount: '80', fee: '0' };
     const inflowPlug: HostActivity = { ...plug, id: 'in', activityType: 'CREDIT', amount: '250', fee: '0' };
@@ -3449,11 +3521,12 @@ describe('startingBalanceFields', () => {
     expect(startingBalanceFields('CASH', -50).activityType).toBe('WITHDRAWAL');
   });
 
-  it('keeps a card spending-neutral in both directions', () => {
-    // The card pair is wrong both ways: DEPOSIT is refused by the API and
-    // WITHDRAWAL classifies as spending.
+  it('gives a card only types Wealthfolio accepts on a card', () => {
+    // DEPOSIT and TRANSFER_OUT are both refused on a card. A credit opening is
+    // a neutral TRANSFER_IN; an opening DEBT has no neutral option, so it is a
+    // WITHDRAWAL (see neutralAdjustmentFields).
     expect(startingBalanceFields('CREDIT_CARD', 235.4).activityType).toBe('TRANSFER_IN');
-    expect(startingBalanceFields('CREDIT_CARD', -235.4).activityType).toBe('TRANSFER_OUT');
+    expect(startingBalanceFields('CREDIT_CARD', -235.4).activityType).toBe('WITHDRAWAL');
   });
 
   it('leaves investment-style accounts on the simple pair', () => {
@@ -3495,10 +3568,9 @@ describe('a credit card can finally get its opening balance', () => {
     const correction = imported.flat().find((r) => r.comment.startsWith('Starting balance · '));
     expect(correction).toBeTruthy();
     expect(correction!.amount).toBe(100);
-    // Card-safe and spending-neutral: TRANSFER_OUT, never a WITHDRAWAL (which
-    // the classifier reads as spending) and never a DEPOSIT (which the API
-    // refuses outright on a card).
-    expect(correction!.activityType).toBe('TRANSFER_OUT');
+    // WITHDRAWAL: the only outflow a card accepts that is not a fee or
+    // interest. TRANSFER_OUT and DEPOSIT are refused outright on a card.
+    expect(correction!.activityType).toBe('WITHDRAWAL');
   });
 
   it('writes nothing when the host has no ledger fallback', async () => {
@@ -3665,5 +3737,252 @@ describe('holdings snapshots for investment accounts', () => {
       await runSyncCore(host, store, { force: true });
       expect(holdings[0].snapshot.cashBalances).toEqual({ USD: '1512.34' });
     });
+  });
+});
+
+describe('the starting balance stays the OLDEST row (v1.54)', () => {
+  // The baseline stands for everything before the account's first synced row.
+  // Dated after older history, Wealthfolio replays that history first and the
+  // account's early balance goes negative — its Health page then reports "cash
+  // account had a negative balance" (live: Savings −$1,300 from 2026-04-23 with
+  // the baseline on 2026-06-19; Spend −$440.50 from 2026-05-03, baseline 06-14).
+  const baselineRow = (over: Partial<HostActivity> = {}): HostActivity => ({
+    id: 'act-start', accountId: 'wf-a', activityType: 'CREDIT',
+    date: '2026-06-18', amount: 4500.38, comment: 'Starting balance · sfin-1',
+    sourceGroupId: null, subtype: null, ...over,
+  });
+
+  it('moves the baseline to the day before older history it just netted out', async () => {
+    const { host, store, saved } = createFakeHost({
+      accountSet: { errors: [], accounts: [{
+        id: 'sfin-1', name: 'C', currency: 'USD', balance: '3200.38', 'balance-date': 1,
+        transactions: [{
+          id: 'tx-old', posted: Math.floor(Date.parse('2026-04-23T12:00:00Z') / 1000),
+          amount: '-1300.00', description: 'ACH Withdrawal',
+        }],
+      }] },
+      mapping: { 'sfin-1': 'wf-a' },
+      existing: new Map([['wf-a', [baselineRow()]]]),
+    });
+    await runSyncCore(host, store, {});
+    const updates = saved.flatMap((s) => s.updates ?? []).filter((u) => u.id === 'act-start');
+    expect(updates.at(-1)).toMatchObject({ activityDate: '2026-04-22', activityType: 'CREDIT' });
+    expect(updates.at(-1)!.amount).toBeCloseTo(5800.38, 2);
+  });
+
+  it('re-dates a baseline already sitting after older rows, without touching its amount', async () => {
+    // Nick's ledger today: the netting happened on an earlier version, so no
+    // new row arrives to trigger it — the sync has to notice on its own.
+    const { host, store, saved } = createFakeHost({
+      accountSet: { errors: [], accounts: [{
+        id: 'sfin-1', name: 'C', currency: 'USD', balance: '0', 'balance-date': 1, transactions: [],
+      }] },
+      mapping: { 'sfin-1': 'wf-a' },
+      accountTypes: { 'wf-a': 'CASH' },
+      existing: new Map([['wf-a', [
+        baselineRow(),
+        { id: 'old', accountId: 'wf-a', activityType: 'WITHDRAWAL', date: '2026-04-23', amount: 1300,
+          comment: 'ACH Withdrawal · tx-old', sourceGroupId: null, subtype: null },
+      ]]]),
+    });
+    await runSyncCore(host, store, { force: true });
+    const updates = saved.flatMap((s) => s.updates ?? []).filter((u) => u.id === 'act-start');
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).toMatchObject({ activityDate: '2026-04-22', activityType: 'CREDIT', amount: 4500.38 });
+    // Omitted, so the stored asset is left exactly as it is.
+    expect(updates[0].symbol).toBeUndefined();
+  });
+
+  it('leaves a baseline that is already the oldest row alone', async () => {
+    const { host, store, saved } = createFakeHost({
+      accountSet: { errors: [], accounts: [{
+        id: 'sfin-1', name: 'C', currency: 'USD', balance: '0', 'balance-date': 1, transactions: [],
+      }] },
+      mapping: { 'sfin-1': 'wf-a' },
+      accountTypes: { 'wf-a': 'CASH' },
+      existing: new Map([['wf-a', [
+        baselineRow({ date: '2026-04-01' }),
+        { id: 'later', accountId: 'wf-a', activityType: 'WITHDRAWAL', date: '2026-04-23', amount: 1300,
+          comment: 'ACH Withdrawal · tx-old', sourceGroupId: null, subtype: null },
+      ]]]),
+    });
+    await runSyncCore(host, store, { force: true });
+    expect(saved.flatMap((s) => s.updates ?? []).filter((u) => u.id === 'act-start')).toEqual([]);
+  });
+
+  it("reads a card baseline's TRANSFER_OUT as money owed when netting older charges", async () => {
+    // A card opening balance of $500 owed, stored as TRANSFER_OUT (v1.51's shape,
+    // accepted only before Wealthfolio 3.8).
+    // Read back as +$500, netting a recovered $50 charge produced +$550 — the
+    // opening DEBT flipped into a $550 credit.
+    const { host, store, saved } = createFakeHost({
+      accountSet: { errors: [], accounts: [{
+        id: 'sfin-1', name: 'Card', currency: 'USD', balance: '-500', 'balance-date': 1,
+        transactions: [{
+          id: 'tx-old', posted: Math.floor(Date.parse('2026-04-23T12:00:00Z') / 1000),
+          amount: '-50.00', description: 'COFFEE SHOP',
+        }],
+      }] },
+      mapping: { 'sfin-1': 'wf-a' },
+      accountTypes: { 'wf-a': 'CREDIT_CARD' },
+      existing: new Map([['wf-a', [baselineRow({ activityType: 'TRANSFER_OUT', amount: 500 })]]]),
+    });
+    await runSyncCore(host, store, {});
+    const update = saved.flatMap((s) => s.updates ?? []).filter((u) => u.id === 'act-start').at(-1)!;
+    // Rewritten as a WITHDRAWAL: a stored TRANSFER_OUT (possible only from
+    // before Wealthfolio 3.8) cannot be written back on a card.
+    expect(update).toMatchObject({ activityType: 'WITHDRAWAL', amount: 450, activityDate: '2026-04-22' });
+  });
+});
+
+describe("the sync's own unlinked transfer rows are marked external (v1.54)", () => {
+  // Wealthfolio 3.8's Health page reports every posted TRANSFER_IN/OUT that is
+  // not one half of a valid pair as an "incomplete transfer" — unless its
+  // metadata says `flow.is_external: true` (health/service.rs,
+  // invalid_transfer_groups_from_activities). Opening balances, drift plugs and
+  // in-transit placeholders are transfer-TYPED only to stay spending-neutral;
+  // none has a partner to pair with, so each one was an error there.
+  const EXTERNAL = JSON.stringify({ flow: { is_external: true } });
+  const seed = (rows: HostActivity[], accountType = 'CREDIT_CARD'): FakeHostSeed => ({
+    accountSet: { errors: [], accounts: [{
+      id: 'sfin-1', name: 'Card', currency: 'USD', balance: '0', 'balance-date': 1, transactions: [],
+    }] },
+    mapping: { 'sfin-1': 'wf-a' },
+    accountTypes: { 'wf-a': accountType },
+    existing: new Map([['wf-a', rows]]),
+  });
+  const row = (over: Partial<HostActivity>): HostActivity => ({
+    id: 'r', accountId: 'wf-a', activityType: 'TRANSFER_IN', date: '2026-04-18', amount: '235.4',
+    comment: 'Starting balance · sfin-1', sourceGroupId: null, subtype: null, metadata: null, ...over,
+  });
+
+  it('stamps an opening balance, a plug and an aged placeholder', async () => {
+    const { host, store, saved, activities } = createFakeHost(seed([
+      row({ id: 'sb' }),
+      row({ id: 'plug', date: '2026-06-12', amount: '80', comment: 'Balance adjustment · sfin-1 · 2026-06-12' }),
+      row({ id: 'ph', date: '2026-05-02', amount: '700', comment: '↔️ In-transit transfer · AUTOPAY · tx-z' }),
+    ]));
+    await runSyncCore(host, store, { force: true });
+    const byId = new Map(saved.flatMap((s) => s.updates ?? []).map((u) => [u.id, u]));
+    expect(byId.get('sb')).toMatchObject({ metadata: EXTERNAL, activityType: 'TRANSFER_IN', amount: 235.4, activityDate: '2026-04-18', comment: 'Starting balance · sfin-1' });
+    expect(byId.get('plug')).toMatchObject({ metadata: EXTERNAL, activityType: 'TRANSFER_IN', amount: 80 });
+    expect(byId.get('ph')).toMatchObject({ metadata: EXTERNAL, activityType: 'TRANSFER_IN', amount: 700 });
+    for (const id of ['sb', 'plug', 'ph']) expect(byId.get(id)!.symbol).toBeUndefined();
+    // And it holds: a second run has nothing left to stamp.
+    saved.length = 0;
+    await runSyncCore(host, store, { force: true });
+    expect(saved.flatMap((s) => s.updates ?? []).filter((u) => u.metadata === EXTERNAL)).toEqual([]);
+    expect(activities.get('wf-a')!.find((a) => a.id === 'sb')!.metadata).toBe(EXTERNAL);
+  });
+
+  it('never touches a linked leg, a user transfer, a non-transfer row, or a row whose metadata the host cannot report', async () => {
+    const { host, store, saved } = createFakeHost(seed([
+      // Linked: the link stamps is_external:false, and marking one leg of a
+      // pair external makes Wealthfolio report the PAIR as conflicting.
+      row({ id: 'linked', comment: '↔️ In-transit transfer · PAYMENT · tx-p', metadata: JSON.stringify({ flow: { is_external: false } }), sourceGroupId: 'wf-transfer-1' }),
+      row({ id: 'grouped', comment: '↔️ In-transit transfer · PAYMENT · tx-q', sourceGroupId: 'wf-transfer-2' }),
+      row({ id: 'user', comment: 'Transfer from Savings · tx-u' }),
+      row({ id: 'credit', activityType: 'CREDIT', comment: 'Balance adjustment · sfin-1 · 2026-06-12' }),
+      row({ id: 'unknown', metadata: undefined }),
+      row({ id: 'done', metadata: EXTERNAL }),
+      row({ id: 'object', metadata: { flow: { is_external: true } } as unknown as string }),
+    ]));
+    await runSyncCore(host, store, { force: true });
+    expect(saved.flatMap((s) => s.updates ?? []).filter((u) => u.metadata !== undefined)).toEqual([]);
+  });
+
+  it('writes a new in-transit transfer placeholder with the marker already on', async () => {
+    const posted = Math.floor(Date.now() / 1000) - 3600;
+    const s = seed([], 'CASH');
+    s.accountSet!.accounts[0].transactions = [{
+      id: 'tx-live', posted, amount: '-429.71', description: 'Online Transfer to Savings',
+    }];
+    const { host, store, saved } = createFakeHost(s);
+    await runSyncCore(host, store, { force: true });
+    const create = saved.flatMap((r) => r.creates ?? []).find((c) => c.comment.includes('tx-live'))!;
+    expect(create).toMatchObject({ activityType: 'TRANSFER_OUT', metadata: EXTERNAL });
+  });
+});
+
+describe('an update never marks a linked leg external (v1.54)', () => {
+  it('drops the marker when the stored row is grouped', async () => {
+    const posted = Math.floor(Date.now() / 1000) - 3600;
+    const day = new Date(posted * 1000).toISOString().slice(0, 10);
+    const { host, store, saved } = createFakeHost({
+      accountSet: { errors: [], accounts: [{
+        id: 'sfin-1', name: 'Checking', currency: 'USD', balance: '0', 'balance-date': 1,
+        transactions: [{ id: 'tx-live', posted, amount: '-430.00', description: 'Online Transfer to Savings' }],
+      }] },
+      mapping: { 'sfin-1': 'wf-a' },
+      accountTypes: { 'wf-a': 'CASH' },
+      // Linked earlier; the bank has since revised the amount, which is the one
+      // change a linked leg is still updated for (its type and date are kept as
+      // stored — see keepLinkedLegAsStored). That update must not carry the
+      // external marker.
+      existing: new Map([['wf-a', [{
+        id: 'leg', accountId: 'wf-a', activityType: 'TRANSFER_OUT', date: day, amount: '429.71',
+        comment: 'Online Transfer to Savings · tx-live', sourceGroupId: 'wf-transfer-9', subtype: null,
+        metadata: JSON.stringify({ flow: { is_external: false } }),
+      }]]]),
+    });
+    await runSyncCore(host, store, { force: true });
+    const u = saved.flatMap((r) => r.updates ?? []).find((x) => x.id === 'leg');
+    expect(u).toBeTruthy();
+    expect(u!.amount).toBe(430);
+    expect(u!.activityType).toBe('TRANSFER_OUT');
+    expect(u!.comment).not.toContain('In-transit');
+    expect(u!.metadata).toBeUndefined();
+  });
+});
+
+describe('planAmazonLateLabels', () => {
+  const row = (over: Partial<{ txId: string; type: string; comment: string; pending: boolean; sourceGroupId: string | null }> = {}) => ({
+    wfId: 'act-amz', wfAccountId: 'wf-a', txId: 'tx-amz', absCents: 2118, type: 'WITHDRAWAL',
+    date: '2026-08-06', pending: false, comment: 'AMAZON.COM*MB3T81 · tx-amz', sourceGroupId: null,
+    ...over,
+  });
+  const labelled = new Map([['tx-amz', {
+    bare: 'AMAZON.COM*MB3T81', enriched: 'AMAZON.COM*MB3T81 · Amazon: Lawn & Garden',
+  }]]);
+
+  it('labels the sync\'s own note and passes everything else through unchanged', () => {
+    expect(planAmazonLateLabels([row()], labelled, 'USD')).toEqual([{
+      id: 'act-amz', accountId: 'wf-a', activityType: 'WITHDRAWAL', activityDate: '2026-08-06',
+      amount: 21.18, currency: 'USD', comment: 'AMAZON.COM*MB3T81 · Amazon: Lawn & Garden · tx-amz',
+    }]);
+  });
+
+  it('leaves a note someone edited alone', () => {
+    expect(planAmazonLateLabels([row({ comment: 'Garden hose · tx-amz' })], labelled, 'USD')).toEqual([]);
+  });
+
+  it('never touches half of a linked transfer', () => {
+    // Wealthfolio copies an updated linked leg's note onto its partner.
+    expect(planAmazonLateLabels([row({ sourceGroupId: 'grp-1' })], labelled, 'USD')).toEqual([]);
+  });
+
+  it('never touches a transfer-typed row, even on a host that cannot report links', () => {
+    // The addon host never reads sourceGroupId (readsSourceGroupId: false), so a
+    // linked leg arrives there with sourceGroupId null. Only transfer-typed rows
+    // are ever linked, so the type is the guard that holds on both writers.
+    expect(planAmazonLateLabels([row({ type: 'TRANSFER_OUT' })], labelled, 'USD')).toEqual([]);
+  });
+
+  it('leaves a pending charge to the update that posts it', () => {
+    expect(planAmazonLateLabels(
+      [row({ pending: true, comment: 'AMAZON.COM*MB3T81 · tx-amz · pending' })], labelled, 'USD',
+    )).toEqual([]);
+  });
+
+  it('never rewrites a note that already carries the label', () => {
+    // Idempotent across syncs and across the two writers (addon + companion).
+    expect(planAmazonLateLabels(
+      [row({ comment: 'AMAZON.COM*MB3T81 · Amazon: Lawn & Garden · tx-amz' })], labelled, 'USD',
+    )).toEqual([]);
+  });
+
+  it('ignores rows no order matched', () => {
+    expect(planAmazonLateLabels([row({ txId: 'tx-other', comment: 'AMAZON.COM*X · tx-other' })], labelled, 'USD'))
+      .toEqual([]);
   });
 });

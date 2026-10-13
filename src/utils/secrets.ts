@@ -1,7 +1,9 @@
+import { parseReportStore, reportsSecretKey, type ReportKind, type ReportStore } from '../../shared/reports-archive';
+import { SKIPPED_TRANSACTIONS_SECRET_KEY, parseSkippedTransactions, type SkippedTransaction } from '../../shared/skipped-transactions';
 import type { AddonContext } from '@wealthfolio/addon-sdk';
 import { AMAZON_LEDGER_SECRET_KEY } from '../../shared/amazon-ledger';
 import { AMAZON_CONFIG_SECRET_KEY, AMAZON_LABELS_SECRET_KEY } from '../../shared/amazon-config';
-import { UNCATEGORIZED_STATUS_SECRET_KEY, AMAZON_MAIL_STATUS_SECRET_KEY, POOL_STATUS_SECRET_KEY } from '../../shared/status-keys';
+import { UNCATEGORIZED_STATUS_SECRET_KEY, AMAZON_MAIL_STATUS_SECRET_KEY, AMAZON_MAIL_SAMPLES_SECRET_KEY, POOL_STATUS_SECRET_KEY, type AmazonMailStatus, type AmazonMailSamples } from '../../shared/status-keys';
 import { SEMESTER_POOL_SECRET_KEY, parsePoolConfig } from '../../shared/pool';
 import type { SemesterPoolConfig, PoolStatus } from '../../shared/pool';
 import { REPORT_CUBE_SECRET_KEY, parseReportCube } from '../../shared/report-cube';
@@ -17,7 +19,8 @@ import type { DismissalLedger, UncategorizedRow } from '../../shared/uncategoriz
 import type { DriftAlertEntry, TransferLinkFailureEntry } from '../../shared/sync-host';
 import type { SyncResult } from '../../shared/sync-core';
 import { LARGE_TX_OUTBOX_SECRET_KEY } from '../../shared/telegram';
-import { ADDON_VERSION_SECRET_KEY, SIMPLEFIN_SYNC_VERSION } from '../../shared/version';
+import { ADDON_VERSION_SECRET_KEY, INSTALLED_ADDON_VERSION_SECRET_KEY, SIMPLEFIN_SYNC_VERSION } from '../../shared/version';
+import { REFUSED_ALERTED_SECRET_KEY } from '../../shared/refused-alerts';
 import { HIDDEN_SUBSCRIPTIONS_SECRET_KEY, CONFIRMED_SUBSCRIPTIONS_SECRET_KEY, parseHiddenSubscriptions } from '../../shared/subscriptions';
 
 /** Per-account balance snapshot captured on each sync, for the Sync page. */
@@ -32,7 +35,9 @@ export interface GlyphStylePref {
 }
 
 export interface UiState {
-  activeTab?: 'budget' | 'overview' | 'notifications' | 'advanced';
+  /** As stored, from any version: 1.56 and earlier wrote five tab ids. Read
+   *  through `resolveStoredTab`, never trusted as a current `TabId`. */
+  activeTab?: string;
   checklistDismissed?: boolean;
 }
 
@@ -84,6 +89,7 @@ const KEYS = {
   unmappedAccounts: 'unmapped_accounts',
   ignoredAccounts: 'ignored_accounts',
   balanceIncludesHoldings: 'balance_includes_holdings',
+  skippedTransactions: SKIPPED_TRANSACTIONS_SECRET_KEY,
   autoHeal: 'auto_heal',
   autoAdjust: 'auto_adjust',
   telegramConfig: 'telegram_config',
@@ -95,6 +101,8 @@ const KEYS = {
   countOffBudget: 'count_off_budget',
   capWeeklyToPool: 'cap_weekly_to_pool',
   overBudgetSpent: 'over_budget_spent',
+  // Retired in 1.57 (both lines now only appear to warn). Kept here so Reset
+  // still deletes a value an older version stored.
   monthProjection: 'month_projection',
   poolLine: 'pool_line',
   semesterPool: SEMESTER_POOL_SECRET_KEY,
@@ -118,6 +126,9 @@ const KEYS = {
   // key that is easy to leave out of KEYS. Left out here, a reset account would
   // keep showing a stale "emails unread" warning from before the reset.
   amazonMailStatus: AMAZON_MAIL_STATUS_SECRET_KEY,
+  // And the unreadable-email samples beside it: companion-written, the same
+  // easy-to-forget shape, and they hold (redacted) receipt text.
+  amazonMailSamples: AMAZON_MAIL_SAMPLES_SECRET_KEY,
   // Same bug, same fix, for the Amazon mailbox credentials: these three read
   // and write their key constants directly (see `getAmazonConfig` etc.) rather
   // than through KEYS, so they were also missing from `clearAll`. That meant
@@ -149,6 +160,11 @@ export class SecretsStore {
     const current = await this.ctx.api.secrets.get(ADDON_VERSION_SECRET_KEY);
     if (current === SIMPLEFIN_SYNC_VERSION) return;
     await this.ctx.api.secrets.set(ADDON_VERSION_SECRET_KEY, SIMPLEFIN_SYNC_VERSION);
+  }
+
+  /** A report's live edition and archive, published by the companion. */
+  async getReports(kind: ReportKind): Promise<ReportStore> {
+    return parseReportStore(await this.ctx.api.secrets.get(reportsSecretKey(kind)));
   }
 
   async getAccessUrl(): Promise<string | null> {
@@ -262,6 +278,15 @@ export class SecretsStore {
     await this.ctx.api.secrets.set(KEYS.transferLinkFailures, JSON.stringify(map));
   }
 
+  /** Refused imports already announced, shared with the companion (see
+   *  shared/refused-alerts.ts). Raw text: the shared module owns the parse. */
+  async getAnnouncedRefusals(): Promise<string | null> {
+    return this.ctx.api.secrets.get(REFUSED_ALERTED_SECRET_KEY);
+  }
+  async setAnnouncedRefusals(json: string): Promise<void> {
+    await this.ctx.api.secrets.set(REFUSED_ALERTED_SECRET_KEY, json);
+  }
+
   /** Category names the companion has seen while building its last report —
    *  read-only from the addon's side, published by the companion. */
   /**
@@ -297,6 +322,13 @@ export class SecretsStore {
    *  which is exactly why this is worth showing. */
   async getCompanionVersion(): Promise<string | null> {
     const raw = await this.ctx.api.secrets.get(KEYS.companionVersion);
+    return raw && raw.trim() ? raw.trim() : null;
+  }
+
+  /** The installed zip's manifest version, as the companion read it off disk;
+   *  null when no companion can see the addons directory. */
+  async getInstalledAddonVersion(): Promise<string | null> {
+    const raw = await this.ctx.api.secrets.get(INSTALLED_ADDON_VERSION_SECRET_KEY);
     return raw && raw.trim() ? raw.trim() : null;
   }
 
@@ -505,6 +537,11 @@ export class SecretsStore {
     await this.ctx.api.secrets.set(KEYS.balanceIncludesHoldings, JSON.stringify(ids));
   }
 
+  /** Bank transactions never to import (see shared/skipped-transactions.ts). */
+  async getSkippedTransactions(): Promise<SkippedTransaction[]> {
+    return parseSkippedTransactions(await this.ctx.api.secrets.get(KEYS.skippedTransactions));
+  }
+
   /** Which collapsible config cards the user left open, keyed by card id.
    *  Purely cosmetic, so a malformed value degrades to "everything closed"
    *  rather than surfacing an error — but it is worth storing: the account
@@ -543,6 +580,20 @@ export class SecretsStore {
   /** Companion-published count of uncategorized spending (last 90 days).
    *  `null` (absent/corrupt) hides the Overview tile — the addon cannot compute
    *  this itself: the SDK exposes no category data. */
+  /** The companion's sync-health record — written ONLY by the companion, so a
+   *  recent `lastSuccessAt` is the evidence that one is running (and sending
+   *  the daily report). Null when absent or unreadable. */
+  async getSyncHealth(): Promise<{ lastSuccessAt?: string | null } | null> {
+    const raw = await this.ctx.api.secrets.get('sync_health');
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
   async getUncategorizedStatus(): Promise<{ count: number; asOf: string; rows: UncategorizedRow[] } | null> {
     const raw = await this.ctx.api.secrets.get(UNCATEGORIZED_STATUS_SECRET_KEY);
     if (!raw) return null;
@@ -571,14 +622,39 @@ export class SecretsStore {
    * throwing: a companion that predates this key, or one whose Amazon mail
    * isn't configured, must look identical to "no problem" — never an error.
    */
-  async getAmazonMailStatus(): Promise<{ unparsed: number; asOf: string } | null> {
+  async getAmazonMailStatus(): Promise<AmazonMailStatus | null> {
     const raw = await this.ctx.api.secrets.get(AMAZON_MAIL_STATUS_SECRET_KEY);
     if (!raw) return null;
     try {
       const parsed = JSON.parse(raw);
       return typeof parsed?.unparsed === 'number' && Number.isFinite(parsed.unparsed)
-        ? { unparsed: parsed.unparsed, asOf: String(parsed.asOf ?? '') }
+        ? {
+          unparsed: parsed.unparsed,
+          asOf: String(parsed.asOf ?? ''),
+          ...(typeof parsed.lastMailAt === 'string' ? { lastMailAt: parsed.lastMailAt } : {}),
+          ...(typeof parsed.error === 'string' && parsed.error ? { error: parsed.error } : {}),
+        }
         : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Companion-published copies of the Amazon emails the parser could not read
+   * (see `AMAZON_MAIL_SAMPLES_SECRET_KEY`). `null` when absent or corrupt, and
+   * malformed entries are dropped — like the status, an older companion that
+   * never writes this must look identical to "nothing to show".
+   */
+  async getAmazonMailSamples(): Promise<AmazonMailSamples | null> {
+    const raw = await this.ctx.api.secrets.get(AMAZON_MAIL_SAMPLES_SECRET_KEY);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed?.samples)) return null;
+      const samples = parsed.samples.filter((s: any) => s
+        && typeof s.subject === 'string' && typeof s.plain === 'string' && typeof s.html === 'string');
+      return { asOf: String(parsed.asOf ?? ''), samples };
     } catch {
       return null;
     }
@@ -677,26 +753,6 @@ export class SecretsStore {
   }
   async setOverBudgetSpent(mode: 'total' | 'all' | 'none'): Promise<void> {
     await this.ctx.api.secrets.set(KEYS.overBudgetSpent, mode);
-  }
-
-  /** Whether the daily report carries Wealthfolio's month-end forecast.
-   *  Stores the opt-OUT, so the default is on. */
-  async getMonthProjection(): Promise<boolean> {
-    const raw = await this.ctx.api.secrets.get(KEYS.monthProjection);
-    return raw !== 'off';
-  }
-  async setMonthProjection(on: boolean): Promise<void> {
-    await this.ctx.api.secrets.set(KEYS.monthProjection, on ? 'on' : 'off');
-  }
-
-  /** Whether the daily report carries the semester-pool line. Opt-OUT like the
-   *  projection above, so the default is on whenever a pool exists. */
-  async getPoolLine(): Promise<boolean> {
-    const raw = await this.ctx.api.secrets.get(KEYS.poolLine);
-    return raw !== 'off';
-  }
-  async setPoolLine(on: boolean): Promise<void> {
-    await this.ctx.api.secrets.set(KEYS.poolLine, on ? 'on' : 'off');
   }
 
   /** The user's semester-pool config, or null when none (or an invalid one) is

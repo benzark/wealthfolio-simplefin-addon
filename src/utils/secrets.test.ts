@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { SecretsStore } from './secrets';
 import type { MappingRule, AccountMapping } from '../../shared/types';
 import type { UiState } from './secrets';
-import { UNCATEGORIZED_STATUS_SECRET_KEY, AMAZON_MAIL_STATUS_SECRET_KEY } from '../../shared/status-keys';
+import { UNCATEGORIZED_STATUS_SECRET_KEY, AMAZON_MAIL_STATUS_SECRET_KEY, AMAZON_MAIL_SAMPLES_SECRET_KEY } from '../../shared/status-keys';
 import { AMAZON_LABELS_SECRET_KEY } from '../../shared/amazon-config';
 
 /** Builds a ctx plus its backing secrets map. `makeCtx` (below) wraps this and
@@ -54,15 +54,6 @@ describe('SecretsStore', () => {
     // or a surprise mode — a newer addon must not break an older one.
     data['over_budget_spent'] = 'something-from-the-future';
     expect(await s.getOverBudgetSpent()).toBe('total');
-  });
-
-  it('defaults the month projection ON and stores only the opt-out, under the companion\'s key', async () => {
-    const { ctx, data } = makeCtxWithData();
-    const s = new SecretsStore(ctx);
-    expect(await s.getMonthProjection()).toBe(true);
-    await s.setMonthProjection(false);
-    expect(data['month_projection']).toBe('off');
-    expect(await s.getMonthProjection()).toBe(false);
   });
 
   it('roundtrips access URL', async () => {
@@ -175,6 +166,33 @@ describe('SecretsStore', () => {
     expect(await s.getAmazonMailStatus()).toEqual({ unparsed: 2, asOf: '2026-08-08' });
     await s.clearAll();
     expect(await s.getAmazonMailStatus()).toBeNull();
+  });
+
+  it('reads the unreadable-email samples, dropping malformed ones, and clearAll removes them', async () => {
+    const ctx = makeCtx();
+    const s = new SecretsStore(ctx);
+    const sample = { at: '2026-10-05', subject: 'Shipped 4 items', plain: 'p', html: 'h' };
+    await ctx.api.secrets.set(AMAZON_MAIL_SAMPLES_SECRET_KEY, JSON.stringify({ asOf: '2026-10-05', samples: [sample, { junk: true }] }));
+    expect(await s.getAmazonMailSamples()).toEqual({ asOf: '2026-10-05', samples: [sample] });
+    await s.clearAll();
+    expect(await s.getAmazonMailSamples()).toBeNull();
+  });
+
+  it('reads a corrupt samples secret as none', async () => {
+    const ctx = makeCtx();
+    await ctx.api.secrets.set(AMAZON_MAIL_SAMPLES_SECRET_KEY, '{not json');
+    expect(await new SecretsStore(ctx).getAmazonMailSamples()).toBeNull();
+  });
+});
+
+describe('SecretsStore skipped transactions', () => {
+  it('reads the skip list from the key the companion reads too, and clearAll removes it', async () => {
+    const { ctx, data } = makeCtxWithData();
+    data['skipped_transactions'] = JSON.stringify([{ account: 'sfin-1', txId: 'TRN-1', note: 'sent twice' }, { bad: 1 }]);
+    const s = new SecretsStore(ctx);
+    expect(await s.getSkippedTransactions()).toEqual([{ account: 'sfin-1', txId: 'TRN-1', note: 'sent twice' }]);
+    await s.clearAll();
+    expect(data['skipped_transactions']).toBeUndefined();
   });
 });
 

@@ -1,14 +1,17 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { Button, CollapsibleCard, Disclosure, ErrorBox, statusToneClass } from './ui';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Button, CollapsibleCard, Disclosure, ErrorBox, statusToneClass, Why } from './ui';
 import type { StatusMessage } from './ui';
 import { CategoryIcon } from './CategoryIcon';
 import {
   DEFAULT_AMAZON_CATEGORY,
+  normalizeAppPassword,
   resolveAmazonCategory,
   type AmazonLabelCatalog,
   type AmazonMailConfig,
 } from '../../shared/amazon-config';
 import type { CategoryCatalogEntry, SecretsStore } from '../utils/secrets';
+import type { AmazonMailSample, AmazonMailSamples, AmazonMailStatus } from '../../shared/status-keys';
+import { amazonSamplesAsFixtureText } from '../../shared/amazon-sample';
 
 /**
  * Setup for automatic categorization of Amazon charges.
@@ -63,7 +66,10 @@ export interface AmazonDraftState {
    * nothing to report or an older companion that never publishes this key;
    * the two must be visually identical (see `getAmazonMailStatus`).
    */
-  mailStatus: { unparsed: number; asOf: string } | null;
+  mailStatus: AmazonMailStatus | null;
+  /** The unreadable emails, when the companion published any. Optional so a
+   *  hand-built state (tests, an older page) needs no change. */
+  samples?: AmazonMailSamples | null;
   /** Has the stored config been read yet? Distinguishes "loading" from "not set
    *  up", which the collapsed summary says out loud. */
   loaded: boolean;
@@ -83,15 +89,23 @@ export function useAmazonDraft(store: SecretsStore): AmazonDraftState {
    *  Telegram tab's `savedCfg` is. */
   const [saved, setSaved] = useState<AmazonDraft>(EMPTY_AMAZON_DRAFT);
   const [labels, setLabels] = useState<AmazonLabelCatalog>({});
-  const [mailStatus, setMailStatus] = useState<{ unparsed: number; asOf: string } | null>(null);
+  const [mailStatus, setMailStatus] = useState<AmazonMailStatus | null>(null);
+  const [samples, setSamples] = useState<AmazonMailSamples | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     // Loaded alongside config + labels, on the same one-shot mount effect —
     // not its own poll, for the same reason the draft itself is one-shot: a
     // re-hydrate on a timer would fight a half-typed password.
-    Promise.all([store.getAmazonConfig(), store.getAmazonLabels(), store.getAmazonMailStatus()])
-      .then(([cfg, seen, status]) => {
+    Promise.all([
+      store.getAmazonConfig(),
+      store.getAmazonLabels(),
+      store.getAmazonMailStatus(),
+      // Optional-called: a store (or test double) from before the samples
+      // existed has no such method, and must read as "nothing to show".
+      store.getAmazonMailSamples?.() ?? null,
+    ])
+      .then(([cfg, seen, status, unreadable]) => {
         if (cfg) {
           const stored: AmazonDraft = {
             host: cfg.host || 'imap.gmail.com',
@@ -105,6 +119,7 @@ export function useAmazonDraft(store: SecretsStore): AmazonDraftState {
         }
         setLabels(seen);
         setMailStatus(status);
+        setSamples(unreadable ?? null);
       })
       .catch(() => {})
       .finally(() => setLoaded(true));
@@ -122,7 +137,8 @@ export function useAmazonDraft(store: SecretsStore): AmazonDraftState {
       enabled: true,
       host: draft.host,
       user: draft.user,
-      password: draft.password,
+      // Google's app passwords are shown with spaces that IMAP rejects.
+      password: normalizeAppPassword(draft.password),
       defaultCategory: draft.defaultCategory,
       labelOverrides: draft.overrides,
     } satisfies AmazonMailConfig);
@@ -134,6 +150,7 @@ export function useAmazonDraft(store: SecretsStore): AmazonDraftState {
     patch,
     labels,
     mailStatus,
+    samples,
     loaded,
     dirty: JSON.stringify(draft) !== JSON.stringify(saved),
     configured: !!(draft.host && draft.user && draft.password),
@@ -158,7 +175,7 @@ interface Props {
 export function AmazonCard({
   amazon, cardId, guideId, open, guideOpen, onToggle, onToggleGuide, categories,
 }: Props) {
-  const { draft, patch, labels, mailStatus, loaded, dirty, configured } = amazon;
+  const { draft, patch, labels, mailStatus, samples, loaded, dirty, configured } = amazon;
   const { host, user, password, defaultCategory, overrides } = draft;
   /** `{ text, tone }` like every other status line in the addon: the ✅ this
    *  message used to open with was its only success signal, so dropping the
@@ -178,6 +195,13 @@ export function AmazonCard({
   // count with no configured mailbox is a stale value left over from before a
   // reset, not a live problem to surface.
   const unparsed = configured ? (mailStatus?.unparsed ?? 0) : 0;
+  // Same rule: a sign-in error is only live while a mailbox is configured.
+  const signInError = configured ? mailStatus?.error ?? null : null;
+  // The companion has read this mailbox, successfully, and never found a
+  // single message in it — the signature of a Gmail filter that forwards
+  // nothing. Not shown before the first check (no `asOf`), when it would be
+  // a guess.
+  const neverReceived = configured && !!mailStatus?.asOf && !signInError && !mailStatus?.lastMailAt;
 
   const summaryBase = !loaded
     ? 'Loading…'
@@ -188,9 +212,11 @@ export function AmazonCard({
         : `On · ${labelNames.length} Amazon categories mapped`;
   // Appended, not replacing: a collapsed card is the one place this warning
   // could otherwise hide entirely, so the summary line has to carry it too.
-  const summary = unparsed > 0
-    ? `${summaryBase} · ${unparsed} email${unparsed === 1 ? '' : 's'} unread`
-    : summaryBase;
+  const summary = signInError
+    ? `${summaryBase} · cannot sign in to the mailbox`
+    : unparsed > 0
+      ? `${summaryBase} · ${unparsed} email${unparsed === 1 ? '' : 's'} unread`
+      : summaryBase;
 
   const save = async () => {
     await amazon.save();
@@ -208,12 +234,36 @@ export function AmazonCard({
       open={open}
       onToggle={onToggle}
     >
+      {signInError && (
+        <ErrorBox detail={signInError}>
+          The companion could not sign in to {user || 'the mailbox'} on its last check, so
+          Amazon charges are not being categorized. Check the address and the app
+          password (paste it exactly as Google shows it — the spaces are fine).
+        </ErrorBox>
+      )}
+
+      {neverReceived && (
+        <div className="sfin-callout">
+          No Amazon emails have reached this mailbox yet. Check that the Gmail filter&apos;s{' '}
+          <strong>To</strong> field is empty.
+          <Why>
+            A filter with anything in its To field matches no Amazon mail, so nothing is
+            forwarded and nothing fails. Gmail also only forwards mail that arrives after
+            the filter is made, so an order placed before then never shows up here.
+          </Why>
+        </div>
+      )}
+
       {unparsed > 0 && (
         <ErrorBox>
           {unparsed} recent email{unparsed === 1 ? '' : 's'} could not be read — Amazon
           may have changed their email format. They stay unread in the mailbox, and
-          charges from them stay uncategorized until this addon gets an update.
+          their charges won&apos;t get an Amazon category until this addon gets an update.
         </ErrorBox>
+      )}
+
+      {unparsed > 0 && samples && samples.samples.length > 0 && (
+        <UnreadableSamples samples={samples.samples} />
       )}
 
       <div className="sfin-subtle" style={{ marginBottom: 12 }}>
@@ -422,5 +472,58 @@ export function AmazonCard({
         </div>
       </div>
     </CollapsibleCard>
+  );
+}
+
+/**
+ * The emails the parser could not read, ready to paste into a bug report — and
+ * from there straight into `shared/__fixtures__/amazon-emails/` as a test.
+ *
+ * A textarea as well as a Copy button: the addon runs in a sandboxed iframe,
+ * where the clipboard API may be refused, and a selectable box always works.
+ */
+function UnreadableSamples({ samples }: { samples: AmazonMailSample[] }) {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState<'idle' | 'ok' | 'failed'>('idle');
+  const text = useMemo(() => amazonSamplesAsFixtureText(samples), [samples]);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied('ok');
+    } catch {
+      setCopied('failed');
+    }
+  };
+  return (
+    <div className="sfin-disc-inset" style={{ marginBottom: 12 }}>
+      <Disclosure
+        id="amazon-unreadable"
+        variant="inline"
+        title="Show what couldn't be read"
+        open={open}
+        onToggle={() => setOpen((o) => !o)}
+      >
+        <p className="sfin-subtle">
+          Email addresses, your name and delivery line, card digits and link codes are
+          removed — but check the text before posting it anywhere public. Paste it into
+          a bug report so the addon can learn the new format.
+        </p>
+        <textarea
+          readOnly
+          aria-label="Emails that could not be read"
+          value={text}
+          rows={10}
+          style={{ width: '100%', fontFamily: 'monospace', fontSize: 12 }}
+          onFocus={(e) => e.currentTarget.select()}
+        />
+        <div style={{ marginTop: 8 }}>
+          <Button variant="outline" onClick={copy}>Copy</Button>
+          {copied === 'ok' && <span className="sfin-subtle"> Copied.</span>}
+          {copied === 'failed' && (
+            <span className="sfin-subtle"> Couldn&apos;t copy here — select the text above and copy it.</span>
+          )}
+        </div>
+      </Disclosure>
+    </div>
   );
 }

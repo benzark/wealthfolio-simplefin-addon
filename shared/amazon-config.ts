@@ -88,3 +88,14 @@ export function isAmazonMessage(from: string | undefined, body: string): boolean
 export function amazonMailConfigured(cfg: AmazonMailConfig | null | undefined): boolean {
   return !!(cfg && cfg.enabled !== false && cfg.host && cfg.user && cfg.password);
 }
+
+/**
+ * Google shows an app password as four groups of four letters, and a pasted
+ * copy keeps the spaces — which IMAP rejects as a wrong password, with nothing
+ * to say why (live, 2026-08-07). Only that exact shape is changed: any other
+ * password is used exactly as typed, since a space can be a real character.
+ */
+export function normalizeAppPassword(password: string): string {
+  const trimmed = password.trim();
+  return /^[a-z]{4}(\s+[a-z]{4}){3}$/i.test(trimmed) ? trimmed.replace(/\s+/g, '') : password;
+}
